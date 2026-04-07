@@ -31,6 +31,7 @@ import (
 var (
 	_ adapter.TCPInjectableInbound = (*MultiInbound)(nil)
 	_ adapter.ManagedSSMServer     = (*MultiInbound)(nil)
+	_ adapter.ManagedUserServer    = (*MultiInbound)(nil)
 )
 
 type MultiInbound struct {
@@ -120,6 +121,16 @@ func (h *MultiInbound) Close() error {
 
 func (h *MultiInbound) SetTracker(tracker adapter.SSMTracker) {
 	h.tracker = tracker
+}
+
+func (h *MultiInbound) ReplaceUsers(users []adapter.User) error {
+	names := make([]string, len(users))
+	passwords := make([]string, len(users))
+	for i, u := range users {
+		names[i] = u.Name
+		passwords[i] = u.Password
+	}
+	return h.UpdateUsers(names, passwords)
 }
 
 func (h *MultiInbound) UpdateUsers(users []string, uPSKs []string) error {

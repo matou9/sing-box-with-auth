@@ -24,6 +24,8 @@ import (
 	"github.com/anytls/sing-anytls/padding"
 )
 
+var _ adapter.ManagedUserServer = (*Inbound)(nil)
+
 func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.AnyTLSInboundOptions](registry, C.TypeAnyTLS, NewInbound)
 }
@@ -94,6 +96,18 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
 
 func (h *Inbound) Close() error {
 	return common.Close(h.listener, h.tlsConfig)
+}
+
+func (h *Inbound) ReplaceUsers(users []adapter.User) error {
+	anytlsUsers := make([]anytls.User, len(users))
+	for i, u := range users {
+		anytlsUsers[i] = anytls.User{
+			Name:     u.Name,
+			Password: u.Password,
+		}
+	}
+	h.service.UpdateUsers(anytlsUsers)
+	return nil
 }
 
 func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {

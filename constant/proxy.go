@@ -33,6 +33,7 @@ const (
 	TypeOOMKiller          = "oom-killer"
 	TypeACME               = "acme"
 	TypeCloudflareOriginCA = "cloudflare-origin-ca"
+	TypeUserProvider       = "user-provider"
 )
 
 const (

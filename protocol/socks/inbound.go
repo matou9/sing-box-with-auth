@@ -24,7 +24,10 @@ func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.SocksInboundOptions](registry, C.TypeSOCKS, NewInbound)
 }
 
-var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
+var (
+	_ adapter.TCPInjectableInbound = (*Inbound)(nil)
+	_ adapter.ManagedUserServer    = (*Inbound)(nil)
+)
 
 type Inbound struct {
 	inbound.Adapter
@@ -68,6 +71,18 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
 
 func (h *Inbound) Close() error {
 	return h.listener.Close()
+}
+
+func (h *Inbound) ReplaceUsers(users []adapter.User) error {
+	authUsers := make([]auth.User, len(users))
+	for i, u := range users {
+		authUsers[i] = auth.User{
+			Username: u.Name,
+			Password: u.Password,
+		}
+	}
+	h.authenticator = auth.NewAuthenticator(authUsers)
+	return nil
 }
 
 func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {

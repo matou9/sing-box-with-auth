@@ -20,16 +20,19 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
+var _ adapter.ManagedUserServer = (*Inbound)(nil)
+
 func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.ShadowTLSInboundOptions](registry, C.TypeShadowTLS, NewInbound)
 }
 
 type Inbound struct {
 	inbound.Adapter
-	router   adapter.Router
-	logger   logger.ContextLogger
-	listener *listener.Listener
-	service  *shadowtls.Service
+	router        adapter.Router
+	logger        logger.ContextLogger
+	listener      *listener.Listener
+	service       *shadowtls.Service
+	serviceConfig shadowtls.ServiceConfig
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.ShadowTLSInboundOptions) (adapter.Inbound, error) {
@@ -67,7 +70,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if err != nil {
 		return nil, err
 	}
-	service, err := shadowtls.NewService(shadowtls.ServiceConfig{
+	inbound.serviceConfig = shadowtls.ServiceConfig{
 		Version:  options.Version,
 		Password: options.Password,
 		Users: common.Map(options.Users, func(it option.ShadowTLSUser) shadowtls.User {
@@ -82,7 +85,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		WildcardSNI:            shadowtls.WildcardSNI(options.WildcardSNI),
 		Handler:                (*inboundHandler)(inbound),
 		Logger:                 logger,
-	})
+	}
+	service, err := shadowtls.NewService(inbound.serviceConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -106,6 +110,23 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
 
 func (h *Inbound) Close() error {
 	return h.listener.Close()
+}
+
+func (h *Inbound) ReplaceUsers(users []adapter.User) error {
+	config := h.serviceConfig
+	config.Users = make([]shadowtls.User, len(users))
+	for i, u := range users {
+		config.Users[i] = shadowtls.User{
+			Name:     u.Name,
+			Password: u.Password,
+		}
+	}
+	service, err := shadowtls.NewService(config)
+	if err != nil {
+		return err
+	}
+	h.service = service
+	return nil
 }
 
 func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {

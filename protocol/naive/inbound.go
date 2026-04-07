@@ -31,7 +31,8 @@ import (
 
 var (
 	ConfigureHTTP3ListenerFunc func(ctx context.Context, logger logger.Logger, listener *listener.Listener, handler http.Handler, tlsConfig tls.ServerConfig, options option.NaiveInboundOptions) (io.Closer, error)
-	WrapError                  func(error) error
+	WrapError func(error) error
+	_         adapter.ManagedUserServer = (*Inbound)(nil)
 )
 
 func RegisterInbound(registry *inbound.Registry) {
@@ -145,6 +146,18 @@ func (n *Inbound) Close() error {
 		n.h3Server,
 		n.tlsConfig,
 	)
+}
+
+func (n *Inbound) ReplaceUsers(users []adapter.User) error {
+	authUsers := make([]auth.User, len(users))
+	for i, u := range users {
+		authUsers[i] = auth.User{
+			Username: u.Name,
+			Password: u.Password,
+		}
+	}
+	n.authenticator = auth.NewAuthenticator(authUsers)
+	return nil
 }
 
 func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {

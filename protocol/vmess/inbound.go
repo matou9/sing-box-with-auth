@@ -32,7 +32,10 @@ func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.VMessInboundOptions](registry, C.TypeVMess, NewInbound)
 }
 
-var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
+var (
+	_ adapter.TCPInjectableInbound = (*Inbound)(nil)
+	_ adapter.ManagedUserServer    = (*Inbound)(nil)
+)
 
 type Inbound struct {
 	inbound.Adapter
@@ -151,6 +154,29 @@ func (h *Inbound) Close() error {
 		h.tlsConfig,
 		h.transport,
 	)
+}
+
+func (h *Inbound) ReplaceUsers(users []adapter.User) error {
+	vmessUsers := make([]option.VMessUser, len(users))
+	for i, u := range users {
+		vmessUsers[i] = option.VMessUser{
+			Name:    u.Name,
+			UUID:    u.UUID,
+			AlterId: u.AlterId,
+		}
+	}
+	err := h.service.UpdateUsers(common.MapIndexed(vmessUsers, func(index int, it option.VMessUser) int {
+		return index
+	}), common.Map(vmessUsers, func(it option.VMessUser) string {
+		return it.UUID
+	}), common.Map(vmessUsers, func(it option.VMessUser) int {
+		return it.AlterId
+	}))
+	if err != nil {
+		return err
+	}
+	h.users = vmessUsers
+	return nil
 }
 
 func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {

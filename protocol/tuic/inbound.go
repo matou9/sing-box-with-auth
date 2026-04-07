@@ -27,6 +27,8 @@ func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.TUICInboundOptions](registry, C.TypeTUIC, NewInbound)
 }
 
+var _ adapter.ManagedUserServer = (*Inbound)(nil)
+
 type Inbound struct {
 	inbound.Adapter
 	router       adapter.ConnectionRouterEx
@@ -98,6 +100,29 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	inbound.server = service
 	inbound.userNameList = userNameList
 	return inbound, nil
+}
+
+func (h *Inbound) ReplaceUsers(users []adapter.User) error {
+	var userList []int
+	var userNameList []string
+	var userUUIDList [][16]byte
+	var userPasswordList []string
+	for i, u := range users {
+		if u.UUID == "" {
+			return E.New("missing uuid for user ", i)
+		}
+		userUUID, err := uuid.FromString(u.UUID)
+		if err != nil {
+			return E.Cause(err, "invalid uuid for user ", i)
+		}
+		userList = append(userList, i)
+		userNameList = append(userNameList, u.Name)
+		userUUIDList = append(userUUIDList, userUUID)
+		userPasswordList = append(userPasswordList, u.Password)
+	}
+	h.server.UpdateUsers(userList, userUUIDList, userPasswordList)
+	h.userNameList = userNameList
+	return nil
 }
 
 func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {

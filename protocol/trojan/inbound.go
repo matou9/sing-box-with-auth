@@ -27,7 +27,10 @@ func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.TrojanInboundOptions](registry, C.TypeTrojan, NewInbound)
 }
 
-var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
+var (
+	_ adapter.TCPInjectableInbound = (*Inbound)(nil)
+	_ adapter.ManagedUserServer    = (*Inbound)(nil)
+)
 
 type Inbound struct {
 	inbound.Adapter
@@ -162,6 +165,26 @@ func (h *Inbound) Close() error {
 		h.tlsConfig,
 		h.transport,
 	)
+}
+
+func (h *Inbound) ReplaceUsers(users []adapter.User) error {
+	trojanUsers := make([]option.TrojanUser, len(users))
+	for i, u := range users {
+		trojanUsers[i] = option.TrojanUser{
+			Name:     u.Name,
+			Password: u.Password,
+		}
+	}
+	err := h.service.UpdateUsers(common.MapIndexed(trojanUsers, func(index int, it option.TrojanUser) int {
+		return index
+	}), common.Map(trojanUsers, func(it option.TrojanUser) string {
+		return it.Password
+	}))
+	if err != nil {
+		return err
+	}
+	h.users = trojanUsers
+	return nil
 }
 
 func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {

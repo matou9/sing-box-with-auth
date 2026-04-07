@@ -19,6 +19,8 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
+var _ adapter.ManagedUserServer = (*Inbound)(nil)
+
 func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.HysteriaInboundOptions](registry, C.TypeHysteria, NewInbound)
 }
@@ -152,6 +154,20 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 		h.logger.InfoContext(ctx, "inbound packet connection to ", metadata.Destination)
 	}
 	h.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
+}
+
+func (h *Inbound) ReplaceUsers(users []adapter.User) error {
+	userList := make([]int, len(users))
+	userNameList := make([]string, len(users))
+	userPasswordList := make([]string, len(users))
+	for i, u := range users {
+		userList[i] = i
+		userNameList[i] = u.Name
+		userPasswordList[i] = u.Password
+	}
+	h.service.UpdateUsers(userList, userPasswordList)
+	h.userNameList = userNameList
+	return nil
 }
 
 func (h *Inbound) Start(stage adapter.StartStage) error {

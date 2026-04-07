@@ -28,7 +28,10 @@ func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.HTTPMixedInboundOptions](registry, C.TypeMixed, NewInbound)
 }
 
-var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
+var (
+	_ adapter.TCPInjectableInbound = (*Inbound)(nil)
+	_ adapter.ManagedUserServer    = (*Inbound)(nil)
+)
 
 type Inbound struct {
 	inbound.Adapter
@@ -96,6 +99,18 @@ func (h *Inbound) Close() error {
 		h.listener,
 		h.tlsConfig,
 	)
+}
+
+func (h *Inbound) ReplaceUsers(users []adapter.User) error {
+	authUsers := make([]auth.User, len(users))
+	for i, u := range users {
+		authUsers[i] = auth.User{
+			Username: u.Name,
+			Password: u.Password,
+		}
+	}
+	h.authenticator = auth.NewAuthenticator(authUsers)
+	return nil
 }
 
 func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {

@@ -28,6 +28,8 @@ func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.Hysteria2InboundOptions](registry, C.TypeHysteria2, NewInbound)
 }
 
+var _ adapter.ManagedUserServer = (*Inbound)(nil)
+
 type Inbound struct {
 	inbound.Adapter
 	router       adapter.Router
@@ -142,6 +144,20 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	inbound.service = service
 	inbound.userNameList = userNameList
 	return inbound, nil
+}
+
+func (h *Inbound) ReplaceUsers(users []adapter.User) error {
+	userList := make([]int, len(users))
+	userNameList := make([]string, len(users))
+	userPasswordList := make([]string, len(users))
+	for i, u := range users {
+		userList[i] = i
+		userNameList[i] = u.Name
+		userPasswordList[i] = u.Password
+	}
+	h.service.UpdateUsers(userList, userPasswordList)
+	h.userNameList = userNameList
+	return nil
 }
 
 func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
