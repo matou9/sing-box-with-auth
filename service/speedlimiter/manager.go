@@ -19,6 +19,13 @@ type UserLimiter struct {
 	Download *rate.Limiter
 }
 
+// UserSchedule is a runtime per-user schedule rule.
+type UserSchedule struct {
+	TimeRange    string
+	UploadMbps   int
+	DownloadMbps int
+}
+
 // speedConfig holds resolved upload/download Mbps for a user.
 type speedConfig struct {
 	UploadMbps   int
@@ -38,11 +45,12 @@ type scheduleEntry struct {
 type LimiterManager struct {
 	// config
 	defaultConfig *speedConfig
-	groups        map[string]*speedConfig            // group name -> speed
+	groups        map[string]*speedConfig             // group name -> speed
 	userGroups    map[string]string                   // user name -> group name
 	userOverrides map[string]*speedConfig             // user name -> per-user override (may be partial)
 	userRawConfig map[string]*option.SpeedLimiterUser // raw config for partial override detection
 	schedules     []scheduleEntry
+	userSchedules map[string][]scheduleEntry
 
 	// runtime
 	mu       sync.RWMutex
@@ -51,6 +59,9 @@ type LimiterManager struct {
 	// schedule state
 	inSchedule    bool
 	activeSchedul int // index of active schedule, -1 if none
+	lastCheckTime time.Time
+	hasChecked    bool
+	now           func() time.Time
 }
 
 // NewLimiterManager creates a LimiterManager from config options.
@@ -60,8 +71,10 @@ func NewLimiterManager(options option.SpeedLimiterServiceOptions) (*LimiterManag
 		userGroups:    make(map[string]string),
 		userOverrides: make(map[string]*speedConfig),
 		userRawConfig: make(map[string]*option.SpeedLimiterUser),
+		userSchedules: make(map[string][]scheduleEntry),
 		limiters:      make(map[string]*UserLimiter),
 		activeSchedul: -1,
+		now:           time.Now,
 	}
 
 	if options.Default != nil {
@@ -124,7 +137,7 @@ func (m *LimiterManager) GetOrCreateLimiter(userName string) *UserLimiter {
 	m.mu.RUnlock()
 
 	// Resolve config
-	cfg := m.resolveConfig(userName)
+	cfg := m.currentSpeed(userName)
 	if cfg == nil {
 		return nil
 	}
@@ -148,6 +161,14 @@ func (m *LimiterManager) GetOrCreateLimiter(userName string) *UserLimiter {
 	m.limiters[userName] = ul
 	m.mu.Unlock()
 	return ul
+}
+
+func (m *LimiterManager) CurrentSpeed(userName string) (int, int, bool) {
+	cfg := m.currentSpeed(userName)
+	if cfg == nil {
+		return 0, 0, false
+	}
+	return cfg.UploadMbps, cfg.DownloadMbps, true
 }
 
 // resolveConfig determines the effective speed config for a user.
@@ -200,94 +221,151 @@ func (m *LimiterManager) resolveConfig(userName string) *speedConfig {
 	return base
 }
 
+func (m *LimiterManager) currentSpeed(userName string) *speedConfig {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if !m.hasChecked {
+		return m.resolveConfig(userName)
+	}
+	return m.effectiveSpeedLocked(userName, m.lastCheckTime)
+}
+
+func (m *LimiterManager) effectiveSpeedLocked(userName string, now time.Time) *speedConfig {
+	base := m.resolveConfig(userName)
+	if base == nil {
+		activeUserSchedule := m.activeUserScheduleLocked(userName, now)
+		if activeUserSchedule == nil {
+			return nil
+		}
+		base = &speedConfig{}
+	}
+
+	if activeGlobal := m.activeGlobalScheduleLocked(userName, now); activeGlobal != nil {
+		if !m.hasFixedUserUploadOverride(userName) && activeGlobal.uploadMbps > 0 {
+			base.UploadMbps = activeGlobal.uploadMbps
+		}
+		if !m.hasFixedUserDownloadOverride(userName) && activeGlobal.downloadMbps > 0 {
+			base.DownloadMbps = activeGlobal.downloadMbps
+		}
+	}
+
+	if activeUser := m.activeUserScheduleLocked(userName, now); activeUser != nil {
+		if !m.hasFixedUserUploadOverride(userName) && activeUser.uploadMbps > 0 {
+			base.UploadMbps = activeUser.uploadMbps
+		}
+		if !m.hasFixedUserDownloadOverride(userName) && activeUser.downloadMbps > 0 {
+			base.DownloadMbps = activeUser.downloadMbps
+		}
+	}
+
+	return base
+}
+
+func (m *LimiterManager) hasFixedUserUploadOverride(userName string) bool {
+	raw := m.userRawConfig[userName]
+	return raw != nil && raw.UploadMbps > 0
+}
+
+func (m *LimiterManager) hasFixedUserDownloadOverride(userName string) bool {
+	raw := m.userRawConfig[userName]
+	return raw != nil && raw.DownloadMbps > 0
+}
+
+func (m *LimiterManager) activeGlobalScheduleLocked(userName string, now time.Time) *scheduleEntry {
+	hour, min := now.Hour(), now.Minute()
+	var active *scheduleEntry
+	for i := range m.schedules {
+		schedule := &m.schedules[i]
+		if !schedule.matchesTime(hour, min) {
+			continue
+		}
+		if len(schedule.groups) > 0 {
+			groupName, inGroup := m.userGroups[userName]
+			if !inGroup || !schedule.groups[groupName] {
+				continue
+			}
+		}
+		active = schedule
+	}
+	return active
+}
+
+func (m *LimiterManager) activeUserScheduleLocked(userName string, now time.Time) *scheduleEntry {
+	schedules := m.userSchedules[userName]
+	if len(schedules) == 0 {
+		return nil
+	}
+	hour, min := now.Hour(), now.Minute()
+	var active *scheduleEntry
+	for i := range schedules {
+		schedule := &schedules[i]
+		if schedule.matchesTime(hour, min) {
+			active = schedule
+		}
+	}
+	return active
+}
+
+func (m *LimiterManager) ReplaceUserSchedules(user string, schedules []UserSchedule) error {
+	if user == "" {
+		return fmt.Errorf("speed-limiter user missing name")
+	}
+	parsed := make([]scheduleEntry, 0, len(schedules))
+	for _, schedule := range schedules {
+		entry, err := parseUserSchedule(schedule)
+		if err != nil {
+			return err
+		}
+		parsed = append(parsed, entry)
+	}
+
+	m.mu.Lock()
+	if len(parsed) == 0 {
+		delete(m.userSchedules, user)
+	} else {
+		m.userSchedules[user] = parsed
+	}
+	m.applyRuntimeStateLocked(m.now())
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *LimiterManager) RemoveUserSchedules(user string) error {
+	if user == "" {
+		return fmt.Errorf("speed-limiter user missing name")
+	}
+	m.mu.Lock()
+	delete(m.userSchedules, user)
+	m.applyRuntimeStateLocked(m.now())
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *LimiterManager) GetUserSchedules(user string) ([]UserSchedule, bool) {
+	m.mu.RLock()
+	schedules, ok := m.userSchedules[user]
+	if !ok || len(schedules) == 0 {
+		m.mu.RUnlock()
+		return nil, false
+	}
+	result := make([]UserSchedule, 0, len(schedules))
+	for _, schedule := range schedules {
+		result = append(result, schedule.toUserSchedule())
+	}
+	m.mu.RUnlock()
+	return result, true
+}
+
 // CheckSchedules evaluates current time against schedules and updates limiter rates.
 // Should be called periodically (e.g., every minute).
 func (m *LimiterManager) CheckSchedules(now time.Time) {
-	if len(m.schedules) == 0 {
-		return
-	}
-
-	hour, min := now.Hour(), now.Minute()
-	activeIdx := -1
-
-	// Find the last matching schedule (later schedules have higher priority)
-	for i := range m.schedules {
-		if m.schedules[i].matchesTime(hour, min) {
-			activeIdx = i
-		}
-	}
-
-	if activeIdx == m.activeSchedul {
-		return // no change
-	}
-
-	m.activeSchedul = activeIdx
-
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	if activeIdx >= 0 {
-		// Apply schedule rates
-		sched := &m.schedules[activeIdx]
-		for userName, ul := range m.limiters {
-			m.applyScheduleToUser(sched, userName, ul)
-		}
-	} else {
-		// Restore default rates
-		for userName, ul := range m.limiters {
-			m.restoreDefaultRates(userName, ul)
-		}
-	}
-}
-
-// applyScheduleToUser applies schedule rates to a user's limiter,
-// respecting per-user override priority.
-func (m *LimiterManager) applyScheduleToUser(sched *scheduleEntry, userName string, ul *UserLimiter) {
-	// Check if schedule targets specific groups
-	if len(sched.groups) > 0 {
-		groupName, inGroup := m.userGroups[userName]
-		if !inGroup || !sched.groups[groupName] {
-			return // user not in targeted groups
-		}
-	}
-
-	// Per-user override always takes priority over schedule
-	raw := m.userRawConfig[userName]
-
-	// Apply upload schedule rate only if user has no per-user upload override
-	if sched.uploadMbps > 0 && (raw == nil || raw.UploadMbps == 0) {
-		if ul.Upload != nil {
-			SetLimiterRate(ul.Upload, sched.uploadMbps)
-		}
-	}
-
-	// Apply download schedule rate only if user has no per-user download override
-	if sched.downloadMbps > 0 && (raw == nil || raw.DownloadMbps == 0) {
-		if ul.Download != nil {
-			SetLimiterRate(ul.Download, sched.downloadMbps)
-		}
-	}
-}
-
-// restoreDefaultRates restores a user's limiter to their base config rates.
-func (m *LimiterManager) restoreDefaultRates(userName string, ul *UserLimiter) {
-	cfg := m.resolveConfig(userName)
-	if cfg == nil {
-		return
-	}
-	if ul.Upload != nil && cfg.UploadMbps > 0 {
-		SetLimiterRate(ul.Upload, cfg.UploadMbps)
-	}
-	if ul.Download != nil && cfg.DownloadMbps > 0 {
-		SetLimiterRate(ul.Download, cfg.DownloadMbps)
-	}
+	m.mu.Lock()
+	m.applyRuntimeStateLocked(now)
+	m.mu.Unlock()
 }
 
 // StartScheduleLoop starts a goroutine that checks schedules every minute.
 func (m *LimiterManager) StartScheduleLoop(ctx context.Context) {
-	if len(m.schedules) == 0 {
-		return
-	}
 	// Initial check
 	m.CheckSchedules(time.Now())
 	go func() {
@@ -304,6 +382,39 @@ func (m *LimiterManager) StartScheduleLoop(ctx context.Context) {
 	}()
 }
 
+func (m *LimiterManager) activeGlobalScheduleIndexLocked(now time.Time) int {
+	hour, min := now.Hour(), now.Minute()
+	activeIdx := -1
+	for i := range m.schedules {
+		if m.schedules[i].matchesTime(hour, min) {
+			activeIdx = i
+		}
+	}
+	return activeIdx
+}
+
+func (m *LimiterManager) updateLimiterRatesLocked(now time.Time) {
+	for userName, limiter := range m.limiters {
+		cfg := m.effectiveSpeedLocked(userName, now)
+		if cfg == nil {
+			continue
+		}
+		if limiter.Upload != nil && cfg.UploadMbps > 0 {
+			SetLimiterRate(limiter.Upload, cfg.UploadMbps)
+		}
+		if limiter.Download != nil && cfg.DownloadMbps > 0 {
+			SetLimiterRate(limiter.Download, cfg.DownloadMbps)
+		}
+	}
+}
+
+func (m *LimiterManager) applyRuntimeStateLocked(now time.Time) {
+	m.activeSchedul = m.activeGlobalScheduleIndexLocked(now)
+	m.lastCheckTime = now
+	m.hasChecked = true
+	m.updateLimiterRatesLocked(now)
+}
+
 // parseSchedule parses a SpeedLimiterSchedule into a scheduleEntry.
 func parseSchedule(s option.SpeedLimiterSchedule) (scheduleEntry, error) {
 	entry := scheduleEntry{
@@ -316,6 +427,30 @@ func parseSchedule(s option.SpeedLimiterSchedule) (scheduleEntry, error) {
 		for _, g := range s.Groups {
 			entry.groups[g] = true
 		}
+	}
+
+	parts := strings.SplitN(s.TimeRange, "-", 2)
+	if len(parts) != 2 {
+		return entry, fmt.Errorf("invalid time_range format %q, expected HH:MM-HH:MM", s.TimeRange)
+	}
+
+	var err error
+	entry.startHour, entry.startMin, err = parseTime(parts[0])
+	if err != nil {
+		return entry, fmt.Errorf("invalid time_range start %q: %w", parts[0], err)
+	}
+	entry.endHour, entry.endMin, err = parseTime(parts[1])
+	if err != nil {
+		return entry, fmt.Errorf("invalid time_range end %q: %w", parts[1], err)
+	}
+
+	return entry, nil
+}
+
+func parseUserSchedule(s UserSchedule) (scheduleEntry, error) {
+	entry := scheduleEntry{
+		uploadMbps:   s.UploadMbps,
+		downloadMbps: s.DownloadMbps,
 	}
 
 	parts := strings.SplitN(s.TimeRange, "-", 2)
@@ -366,4 +501,12 @@ func (e *scheduleEntry) matchesTime(hour, min int) bool {
 	}
 	// Cross-midnight range: e.g., 23:00-06:00
 	return now >= start || now < end
+}
+
+func (e scheduleEntry) toUserSchedule() UserSchedule {
+	return UserSchedule{
+		TimeRange:    fmt.Sprintf("%02d:%02d-%02d:%02d", e.startHour, e.startMin, e.endHour, e.endMin),
+		UploadMbps:   e.uploadMbps,
+		DownloadMbps: e.downloadMbps,
+	}
 }

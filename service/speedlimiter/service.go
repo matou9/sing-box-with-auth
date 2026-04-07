@@ -61,6 +61,22 @@ func (s *Service) Close() error {
 	return nil
 }
 
+func (s *Service) CurrentSpeed(user string) (int, int, bool) {
+	return s.manager.CurrentSpeed(user)
+}
+
+func (s *Service) ReplaceUserSchedules(user string, schedules []UserSchedule) error {
+	return s.manager.ReplaceUserSchedules(user, schedules)
+}
+
+func (s *Service) RemoveUserSchedules(user string) error {
+	return s.manager.RemoveUserSchedules(user)
+}
+
+func (s *Service) GetUserSchedules(user string) ([]UserSchedule, bool) {
+	return s.manager.GetUserSchedules(user)
+}
+
 func (s *Service) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
 	user := metadata.User
 	if user == "" {
