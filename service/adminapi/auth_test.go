@@ -41,13 +41,17 @@ func TestAdminAuthLoginReturnsSignedToken(t *testing.T) {
 	}
 
 	var response struct {
-		Token string `json:"token"`
+		Token     string `json:"token"`
+		ExpiresAt string `json:"expires_at"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
 	if response.Token == "" {
 		t.Fatal("expected token in login response")
+	}
+	if response.ExpiresAt != "2023-11-14T22:18:20Z" {
+		t.Fatalf("unexpected expires_at: %q", response.ExpiresAt)
 	}
 	if !strings.Contains(response.Token, ".") {
 		t.Fatalf("expected signed token format, got %q", response.Token)
@@ -88,16 +92,36 @@ func TestAdminAuthLoginUsesDefaultTokenTTLWhenUnspecified(t *testing.T) {
 	}
 
 	var response struct {
-		Token string `json:"token"`
+		Token     string `json:"token"`
+		ExpiresAt string `json:"expires_at"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
+	expectedExpiry := baseTime.Add(12 * time.Hour).UTC().Format(time.RFC3339)
+	if response.ExpiresAt != expectedExpiry {
+		t.Fatalf("unexpected expires_at: got %q want %q", response.ExpiresAt, expectedExpiry)
+	}
+}
 
-	claims := decodeLoginClaims(t, response.Token)
-	expectedExpiry := baseTime.Add(12 * time.Hour).Unix()
-	if claims.Expires != expectedExpiry {
-		t.Fatalf("unexpected token expiry: got %d want %d", claims.Expires, expectedExpiry)
+func TestAdminAuthLoginReturnsServiceUnavailableWhenLoginDisabled(t *testing.T) {
+	auth, err := NewAuthenticator(option.AdminAPIServiceOptions{
+		Admins: []option.AdminCredential{
+			{Username: "alice", Password: "wonderland"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthenticator returned error: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(`{"username":"alice","password":"wonderland"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	auth.LoginHandler(recorder, request)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -286,22 +310,4 @@ func TestAdminAuthMiddlewareRejectsExpiredLoginToken(t *testing.T) {
 	if recorder.Code != http.StatusUnauthorized {
 		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
 	}
-}
-
-func decodeLoginClaims(t *testing.T, token string) loginTokenClaims {
-	t.Helper()
-
-	payloadEncoded, _, ok := strings.Cut(token, ".")
-	if !ok {
-		t.Fatalf("unexpected token format: %q", token)
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(payloadEncoded)
-	if err != nil {
-		t.Fatalf("decode token payload: %v", err)
-	}
-	var claims loginTokenClaims
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		t.Fatalf("decode token claims: %v", err)
-	}
-	return claims
 }

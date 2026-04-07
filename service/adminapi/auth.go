@@ -88,20 +88,26 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 }
 
 func (a *Authenticator) issueLoginToken(username string) (string, error) {
+	token, _, err := a.issueLoginTokenWithExpiry(username)
+	return token, err
+}
+
+func (a *Authenticator) issueLoginTokenWithExpiry(username string) (string, time.Time, error) {
 	if len(a.tokenSecret) == 0 || a.tokenTTL <= 0 {
-		return "", errLoginDisabled
+		return "", time.Time{}, errLoginDisabled
 	}
+	expiresAt := a.now().Add(a.tokenTTL).UTC()
 	claims := loginTokenClaims{
 		Username: username,
-		Expires:  a.now().Add(a.tokenTTL).Unix(),
+		Expires:  expiresAt.Unix(),
 	}
 	payload, err := json.Marshal(claims)
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 	payloadEncoded := base64.RawURLEncoding.EncodeToString(payload)
 	signatureEncoded := base64.RawURLEncoding.EncodeToString(a.signToken(payloadEncoded))
-	return payloadEncoded + "." + signatureEncoded, nil
+	return payloadEncoded + "." + signatureEncoded, expiresAt, nil
 }
 
 func (a *Authenticator) validateBearerToken(token string) (AuthSubject, error) {
