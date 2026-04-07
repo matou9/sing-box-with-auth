@@ -34,6 +34,8 @@ const (
 	TypeACME               = "acme"
 	TypeCloudflareOriginCA = "cloudflare-origin-ca"
 	TypeUserProvider       = "user-provider"
+	TypeSpeedLimiter       = "speed-limiter"
+	TypeTrafficQuota       = "traffic-quota"
 )
 
 const (
@@ -95,6 +97,8 @@ func ProxyDisplayName(proxyType string) string {
 		return "Selector"
 	case TypeURLTest:
 		return "URLTest"
+	case TypeTrafficQuota:
+		return "TrafficQuota"
 	default:
 		return "Unknown"
 	}

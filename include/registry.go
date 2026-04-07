@@ -37,7 +37,9 @@ import (
 	"github.com/sagernet/sing-box/protocol/vmess"
 	originca "github.com/sagernet/sing-box/service/origin_ca"
 	"github.com/sagernet/sing-box/service/resolved"
+	"github.com/sagernet/sing-box/service/speedlimiter"
 	"github.com/sagernet/sing-box/service/ssmapi"
+	"github.com/sagernet/sing-box/service/trafficquota"
 	"github.com/sagernet/sing-box/service/userprovider"
 	E "github.com/sagernet/sing/common/exceptions"
 )
@@ -134,6 +136,8 @@ func ServiceRegistry() *service.Registry {
 	resolved.RegisterService(registry)
 	ssmapi.RegisterService(registry)
 	userprovider.RegisterService(registry)
+	speedlimiter.RegisterService(registry)
+	trafficquota.RegisterService(registry)
 
 	registerDERPService(registry)
 	registerCCMService(registry)
