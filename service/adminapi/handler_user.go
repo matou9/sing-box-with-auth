@@ -1,8 +1,11 @@
 package adminapi
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/sagernet/sing-box/option"
 	userproviderservice "github.com/sagernet/sing-box/service/userprovider"
@@ -65,7 +68,7 @@ func (s *Service) CreateUserHandler(writer http.ResponseWriter, request *http.Re
 		return
 	}
 	if err := s.userProvider.CreateUser(user); err != nil {
-		writer.WriteHeader(http.StatusBadRequest)
+		writeUserProviderError(writer, err)
 		return
 	}
 	writer.WriteHeader(http.StatusNoContent)
@@ -87,7 +90,7 @@ func (s *Service) UpdateUserHandler(writer http.ResponseWriter, request *http.Re
 		AlterId:  userRequest.AlterId,
 		Flow:     userRequest.Flow,
 	}); err != nil {
-		writer.WriteHeader(http.StatusBadRequest)
+		writeUserProviderError(writer, err)
 		return
 	}
 	writer.WriteHeader(http.StatusNoContent)
@@ -104,8 +107,36 @@ func (s *Service) DeleteUserHandler(writer http.ResponseWriter, request *http.Re
 		return
 	}
 	if err := s.userProvider.DeleteUser(userRequest.Name); err != nil {
-		writer.WriteHeader(http.StatusBadRequest)
+		writeUserProviderError(writer, err)
 		return
 	}
 	writer.WriteHeader(http.StatusNoContent)
+}
+
+func writeUserProviderError(writer http.ResponseWriter, err error) {
+	writer.WriteHeader(userProviderErrorStatus(err))
+}
+
+func userProviderErrorStatus(err error) int {
+	switch {
+	case err == nil:
+		return http.StatusNoContent
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return http.StatusServiceUnavailable
+	case isUserProviderNotFoundError(err):
+		return http.StatusNotFound
+	case isUserProviderValidationError(err):
+		return http.StatusBadRequest
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+func isUserProviderValidationError(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "missing ") || strings.Contains(message, "already exists") || strings.Contains(message, "invalid ")
+}
+
+func isUserProviderNotFoundError(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "not found")
 }
