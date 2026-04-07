@@ -93,6 +93,37 @@ func TestUserProviderDeleteUserRemovesOverlayAndPushes(t *testing.T) {
 	}, normalizeUsers(service.ListUsers()))
 }
 
+func TestUserProviderDeleteOverlayOnlyUserDoesNotSuppressFutureSourceUser(t *testing.T) {
+	service := newTestService(nil)
+
+	err := service.loadAndPush()
+	require.NoError(t, err)
+
+	err = service.CreateUser(option.User{
+		Name:     "overlay",
+		Password: "overlay-password",
+	})
+	require.NoError(t, err)
+
+	err = service.DeleteUser("overlay")
+	require.NoError(t, err)
+
+	service.inlineUsers = []option.User{
+		{Name: "overlay", Password: "source-password"},
+	}
+	err = service.loadAndPush()
+	require.NoError(t, err)
+
+	require.Len(t, service.server().pushes, 4)
+	require.Equal(t, []adapter.User{
+		{Name: "overlay", Password: "source-password"},
+	}, normalizeUsers(service.server().lastUsers()))
+
+	user, found := service.GetUser("overlay")
+	require.True(t, found)
+	require.Equal(t, adapter.User{Name: "overlay", Password: "source-password"}, user)
+}
+
 func TestUserProviderDeleteUserSuppressesSourceBackedUser(t *testing.T) {
 	service := newTestService([]option.User{
 		{Name: "source", Password: "source-password"},

@@ -260,9 +260,24 @@ func (s *Service) DeleteUser(name string) error {
 	if !exists {
 		return E.New("user ", name, " not found")
 	}
+	sourceUsers, err := s.sourceUsersLocked()
+	if err != nil {
+		return err
+	}
+	var sourceExists bool
+	for _, user := range sourceUsers {
+		if user.Name == name {
+			sourceExists = true
+			break
+		}
+	}
 	delete(s.overlayUsers, name)
 	s.ensureDeletedUsersLocked()
-	s.deletedUsers[name] = struct{}{}
+	if sourceExists {
+		s.deletedUsers[name] = struct{}{}
+	} else {
+		delete(s.deletedUsers, name)
+	}
 	return s.loadAndPushLocked()
 }
 
