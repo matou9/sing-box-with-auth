@@ -2,6 +2,7 @@ package adminapi
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 )
 
@@ -34,6 +35,10 @@ func (a *Authenticator) LoginHandler(writer http.ResponseWriter, request *http.R
 
 	token, err := a.issueLoginToken(login.Username)
 	if err != nil {
+		if errors.Is(err, errLoginDisabled) {
+			writer.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		writer.WriteHeader(http.StatusInternalServerError)
 		return
 	}

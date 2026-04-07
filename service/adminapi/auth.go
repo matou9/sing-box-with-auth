@@ -35,11 +35,21 @@ type loginTokenClaims struct {
 }
 
 var (
-	errUnauthorized = errors.New("unauthorized")
-	errTokenExpired = errors.New("token expired")
+	errUnauthorized  = errors.New("unauthorized")
+	errTokenExpired  = errors.New("token expired")
+	errLoginDisabled = errors.New("login disabled")
 )
 
+const defaultTokenTTL = 12 * time.Hour
+
 func NewAuthenticator(options option.AdminAPIServiceOptions) (*Authenticator, error) {
+	tokenTTL := time.Duration(options.TokenTTL)
+	if tokenTTL < 0 {
+		return nil, errors.New("token TTL must not be negative")
+	}
+	if tokenTTL == 0 {
+		tokenTTL = defaultTokenTTL
+	}
 	admins := make(map[string]string, len(options.Admins))
 	for _, admin := range options.Admins {
 		admins[admin.Username] = admin.Password
@@ -55,7 +65,7 @@ func NewAuthenticator(options option.AdminAPIServiceOptions) (*Authenticator, er
 		admins:       admins,
 		staticTokens: staticTokens,
 		tokenSecret:  []byte(options.TokenSecret),
-		tokenTTL:     time.Duration(options.TokenTTL),
+		tokenTTL:     tokenTTL,
 		now:          time.Now,
 	}, nil
 }
@@ -67,8 +77,7 @@ func SubjectFromContext(ctx context.Context) (AuthSubject, bool) {
 
 func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		token := extractBearerToken(request.Header.Get("Authorization"))
-		subject, err := a.validateBearerToken(token)
+		subject, err := a.validateAuthorization(request)
 		if err != nil {
 			writer.WriteHeader(http.StatusUnauthorized)
 			return
@@ -80,7 +89,7 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 
 func (a *Authenticator) issueLoginToken(username string) (string, error) {
 	if len(a.tokenSecret) == 0 || a.tokenTTL <= 0 {
-		return "", errUnauthorized
+		return "", errLoginDisabled
 	}
 	claims := loginTokenClaims{
 		Username: username,
@@ -129,6 +138,26 @@ func (a *Authenticator) validateBearerToken(token string) (AuthSubject, error) {
 		return AuthSubject{}, errTokenExpired
 	}
 	return AuthSubject{Username: claims.Username}, nil
+}
+
+func (a *Authenticator) validateAuthorization(request *http.Request) (AuthSubject, error) {
+	token := extractBearerToken(request.Header.Get("Authorization"))
+	if token != "" {
+		return a.validateBearerToken(token)
+	}
+	username, password, ok := request.BasicAuth()
+	if !ok {
+		return AuthSubject{}, errUnauthorized
+	}
+	return a.validateBasicCredentials(username, password)
+}
+
+func (a *Authenticator) validateBasicCredentials(username string, password string) (AuthSubject, error) {
+	expectedPassword, ok := a.admins[username]
+	if !ok || expectedPassword != password {
+		return AuthSubject{}, errUnauthorized
+	}
+	return AuthSubject{Username: username}, nil
 }
 
 func (a *Authenticator) signToken(payload string) []byte {
