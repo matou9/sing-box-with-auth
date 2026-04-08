@@ -9,12 +9,11 @@
 
   "inbounds": [
     {
-      "_comment": "VLESS+WebSocket 入站：UUID 认证由 user-provider 接管，users 留空",
+      "_comment": "VLESS+WebSocket 入站：UUID 认证由 user-provider 接管，无需写 users 字段（omitempty）",
       "type": "vless",
       "tag": "vless-ws-in",
       "listen": "0.0.0.0",
       "listen_port": 443,
-      "users": [],
       "tls": {
         "enabled": true,
         "server_name": "yourdomain.com",
@@ -27,22 +26,20 @@
       }
     },
     {
-      "_comment": "Shadowsocks 入站：密码认证由 user-provider 接管，users 留空",
+      "_comment": "Shadowsocks multi-user 入站：需配 method+password（服务端密钥），用户列表由 user-provider 接管，无需写 users",
       "type": "shadowsocks",
       "tag": "ss-in",
       "listen": "0.0.0.0",
       "listen_port": 8388,
       "method": "2022-blake3-aes-128-gcm",
-      "password": "SERVER_BASE64_PASSWORD_HERE",
-      "users": []
+      "password": "SERVER_BASE64_PASSWORD_HERE"
     },
     {
-      "_comment": "Trojan 入站示例（可选）",
+      "_comment": "Trojan 入站示例（可选），users 由 user-provider 接管，无需写",
       "type": "trojan",
       "tag": "trojan-in",
       "listen": "0.0.0.0",
       "listen_port": 8443,
-      "users": [],
       "tls": {
         "enabled": true,
         "server_name": "yourdomain.com",
