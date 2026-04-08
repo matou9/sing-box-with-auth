@@ -57,8 +57,6 @@ type LimiterManager struct {
 	limiters map[string]*UserLimiter // user name -> active limiter pair
 
 	// schedule state
-	inSchedule    bool
-	activeSchedul int // index of active schedule, -1 if none
 	lastCheckTime time.Time
 	hasChecked    bool
 	now           func() time.Time
@@ -73,7 +71,6 @@ func NewLimiterManager(options option.SpeedLimiterServiceOptions) (*LimiterManag
 		userRawConfig: make(map[string]*option.SpeedLimiterUser),
 		userSchedules: make(map[string][]scheduleEntry),
 		limiters:      make(map[string]*UserLimiter),
-		activeSchedul: -1,
 		now:           time.Now,
 	}
 
@@ -136,8 +133,15 @@ func (m *LimiterManager) GetOrCreateLimiter(userName string) *UserLimiter {
 	}
 	m.mu.RUnlock()
 
-	// Resolve config
-	cfg := m.currentSpeed(userName)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Double-check after acquiring write lock
+	if existing, ok := m.limiters[userName]; ok {
+		return existing
+	}
+
+	cfg := m.currentSpeedLocked(userName)
 	if cfg == nil {
 		return nil
 	}
@@ -146,20 +150,11 @@ func (m *LimiterManager) GetOrCreateLimiter(userName string) *UserLimiter {
 		Upload:   NewLimiter(cfg.UploadMbps),
 		Download: NewLimiter(cfg.DownloadMbps),
 	}
-
-	// Check if both are nil (0 Mbps in both directions)
 	if ul.Upload == nil && ul.Download == nil {
 		return nil
 	}
 
-	m.mu.Lock()
-	// Double-check after acquiring write lock
-	if existing, ok := m.limiters[userName]; ok {
-		m.mu.Unlock()
-		return existing
-	}
 	m.limiters[userName] = ul
-	m.mu.Unlock()
 	return ul
 }
 
@@ -224,6 +219,10 @@ func (m *LimiterManager) resolveConfig(userName string) *speedConfig {
 func (m *LimiterManager) currentSpeed(userName string) *speedConfig {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	return m.currentSpeedLocked(userName)
+}
+
+func (m *LimiterManager) currentSpeedLocked(userName string) *speedConfig {
 	if !m.hasChecked {
 		return m.resolveConfig(userName)
 	}
@@ -382,17 +381,6 @@ func (m *LimiterManager) StartScheduleLoop(ctx context.Context) {
 	}()
 }
 
-func (m *LimiterManager) activeGlobalScheduleIndexLocked(now time.Time) int {
-	hour, min := now.Hour(), now.Minute()
-	activeIdx := -1
-	for i := range m.schedules {
-		if m.schedules[i].matchesTime(hour, min) {
-			activeIdx = i
-		}
-	}
-	return activeIdx
-}
-
 func (m *LimiterManager) updateLimiterRatesLocked(now time.Time) {
 	for userName, limiter := range m.limiters {
 		cfg := m.effectiveSpeedLocked(userName, now)
@@ -409,7 +397,6 @@ func (m *LimiterManager) updateLimiterRatesLocked(now time.Time) {
 }
 
 func (m *LimiterManager) applyRuntimeStateLocked(now time.Time) {
-	m.activeSchedul = m.activeGlobalScheduleIndexLocked(now)
 	m.lastCheckTime = now
 	m.hasChecked = true
 	m.updateLimiterRatesLocked(now)

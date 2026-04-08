@@ -259,7 +259,6 @@ func TestManager_Schedule_CrossMidnight(t *testing.T) {
 	assertRate(t, "after midnight upload", ul.Upload, 200)
 
 	// During schedule (before midnight)
-	m.activeSchedul = -1 // reset
 	m.CheckSchedules(timeAt(23, 30))
 	assertRate(t, "before midnight in schedule upload", ul.Upload, 200)
 
