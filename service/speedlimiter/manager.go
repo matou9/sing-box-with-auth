@@ -385,6 +385,7 @@ func (m *LimiterManager) updateLimiterRatesLocked(now time.Time) {
 	for userName, limiter := range m.limiters {
 		cfg := m.effectiveSpeedLocked(userName, now)
 		if cfg == nil {
+			delete(m.limiters, userName)
 			continue
 		}
 		if limiter.Upload != nil && cfg.UploadMbps > 0 {

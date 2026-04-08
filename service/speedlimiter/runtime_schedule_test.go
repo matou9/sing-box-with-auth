@@ -179,3 +179,39 @@ func TestManagerRemoveUserSchedulesFallsBackToGlobalSchedule(t *testing.T) {
 		t.Fatalf("current speed after removal = %d/%d, want 50/80", uploadMbps, downloadMbps)
 	}
 }
+
+func TestManagerRemoveUserSchedulesEvictsRuntimeOnlyLimiter(t *testing.T) {
+	m, err := NewLimiterManager(option.SpeedLimiterServiceOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.now = func() time.Time { return timeAt(19, 0) }
+
+	if err := m.ReplaceUserSchedules("runtime-only", []UserSchedule{
+		{
+			TimeRange:    "18:00-23:00",
+			UploadMbps:   25,
+			DownloadMbps: 40,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ul := m.GetOrCreateLimiter("runtime-only")
+	if ul == nil {
+		t.Fatal("expected limiter for runtime-only user while schedule is active")
+	}
+	assertRate(t, "runtime-only upload during schedule", ul.Upload, 25)
+	assertRate(t, "runtime-only download during schedule", ul.Download, 40)
+
+	if err := m.RemoveUserSchedules("runtime-only"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, ok := m.CurrentSpeed("runtime-only"); ok {
+		t.Fatal("expected no current speed for runtime-only user after schedule removal")
+	}
+	if got := m.GetOrCreateLimiter("runtime-only"); got != nil {
+		t.Fatal("expected limiter eviction for runtime-only user after schedule removal")
+	}
+}
