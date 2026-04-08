@@ -224,6 +224,20 @@ func (m *QuotaManager) Status(user string) (Status, bool) {
 	}, true
 }
 
+func (m *QuotaManager) GetConfig(user string) (option.TrafficQuotaUser, bool) {
+	config, loaded := m.userConfigs[user]
+	if !loaded {
+		return option.TrafficQuotaUser{}, false
+	}
+	return option.TrafficQuotaUser{
+		Name:        user,
+		QuotaGB:     float64(config.quotaBytes) / float64(1<<30),
+		Period:      string(config.period),
+		PeriodStart: formatPeriodStart(config.periodStart),
+		PeriodDays:  config.periodDays,
+	}, true
+}
+
 func (m *QuotaManager) HasQuota(user string) bool {
 	_, loaded := m.userConfigs[user]
 	return loaded
@@ -479,4 +493,11 @@ func beginningOfDay(value time.Time) time.Time {
 
 func quotaBytes(quotaGB float64) int64 {
 	return int64(math.Round(quotaGB * float64(1<<30)))
+}
+
+func formatPeriodStart(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339)
 }

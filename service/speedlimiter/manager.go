@@ -213,6 +213,18 @@ func (m *LimiterManager) RemoveConfig(user string) error {
 	return nil
 }
 
+func (m *LimiterManager) GetConfig(user string) (option.SpeedLimiterUser, bool) {
+	m.mu.RLock()
+	raw, ok := m.userRawConfig[user]
+	if !ok || raw == nil {
+		m.mu.RUnlock()
+		return option.SpeedLimiterUser{}, false
+	}
+	config := *raw
+	m.mu.RUnlock()
+	return config, true
+}
+
 // resolveConfig determines the effective speed config for a user.
 // Priority: per-user override > group > default.
 // Per-user override fields with value 0 fall through to group/default.

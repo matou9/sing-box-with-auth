@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +15,7 @@ import (
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/service/speedlimiter"
 	"github.com/sagernet/sing-box/service/trafficquota"
+	singservice "github.com/sagernet/sing/service"
 )
 
 type stubUpdateCall struct {
@@ -34,6 +34,22 @@ type stubUserProvider struct {
 	created []option.User
 	updated []stubUpdateCall
 	deleted []string
+}
+
+func (s *stubUserProvider) Start(stage adapter.StartStage) error {
+	return nil
+}
+
+func (s *stubUserProvider) Close() error {
+	return nil
+}
+
+func (s *stubUserProvider) Type() string {
+	return "stub-user-provider"
+}
+
+func (s *stubUserProvider) Tag() string {
+	return "stub-user-provider"
 }
 
 func (s *stubUserProvider) ListUsers() []adapter.User {
@@ -292,8 +308,7 @@ func TestAdminAPIUserCreateAppliesQuotaAndSpeed(t *testing.T) {
 	provider := &stubUserProvider{}
 	quotaService := newAdminAPIUserQuotaService(t)
 	speedService := newAdminAPIUserSpeedService(t)
-	service := newAdminAPIUserTestService(t, "", provider)
-	setAdminAPIRuntimeControllers(service, quotaService, speedService)
+	service := newAdminAPIUserTestService(t, "", provider, quotaService, speedService)
 	token := loginAdminAPIUserTestToken(t, service)
 
 	recorder := performAdminAPIRequest(service, http.MethodPost, service.basePath+"/user/create", `{
@@ -352,8 +367,7 @@ func TestAdminAPIUserDeleteRemovesUserQuotaAndSchedules(t *testing.T) {
 	provider := &stubUserProvider{}
 	quotaService := newAdminAPIUserQuotaService(t)
 	speedService := newAdminAPIUserSpeedService(t)
-	service := newAdminAPIUserTestService(t, "", provider)
-	setAdminAPIRuntimeControllers(service, quotaService, speedService)
+	service := newAdminAPIUserTestService(t, "", provider, quotaService, speedService)
 	token := loginAdminAPIUserTestToken(t, service)
 
 	if err := provider.CreateUser(option.User{Name: "sekai", Password: "password"}); err != nil {
@@ -399,6 +413,78 @@ func TestAdminAPIUserDeleteRemovesUserQuotaAndSchedules(t *testing.T) {
 	}
 	if _, ok := speedService.GetUserSchedules("sekai"); ok {
 		t.Fatal("expected runtime schedules to be removed for sekai")
+	}
+}
+
+func TestAdminAPIUserCreateRollsBackOnScheduleFailure(t *testing.T) {
+	provider := &stubUserProvider{}
+	quotaService := newAdminAPIUserQuotaService(t)
+	speedService := newAdminAPIFailingScheduleSpeedService(t, errors.New("schedule apply failed"))
+	service := newAdminAPIUserTestService(t, "", provider, quotaService, speedService)
+	token := loginAdminAPIUserTestToken(t, service)
+
+	recorder := performAdminAPIRequest(service, http.MethodPost, service.basePath+"/user/create", `{
+		"user":{"name":"rollback-user","password":"create-password"},
+		"quota":{"quota_gb":1,"period":"daily"},
+		"speed":{"upload_mbps":5,"download_mbps":10},
+		"speed_schedules":[{"time_range":"08:00-18:00","upload_mbps":2,"download_mbps":4}]
+	}`, token)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	if len(provider.created) != 1 || provider.created[0].Name != "rollback-user" {
+		t.Fatalf("unexpected create calls: %#v", provider.created)
+	}
+	if len(provider.deleted) != 1 || provider.deleted[0] != "rollback-user" {
+		t.Fatalf("expected rollback delete call, got %#v", provider.deleted)
+	}
+	if _, ok := quotaService.QuotaStatus("rollback-user"); ok {
+		t.Fatal("expected quota rollback for rollback-user")
+	}
+	if _, _, ok := speedService.CurrentSpeed("rollback-user"); ok {
+		t.Fatal("expected speed rollback for rollback-user")
+	}
+}
+
+func TestAdminAPIUserDeleteKeepsLifecycleWhenQuotaCleanupFails(t *testing.T) {
+	provider := &stubUserProvider{}
+	quotaService := newAdminAPIFailingRemoveQuotaService(t, errors.New("quota cleanup failed"))
+	speedService := newAdminAPIUserSpeedService(t)
+	service := newAdminAPIUserTestService(t, "", provider, quotaService, speedService)
+	token := loginAdminAPIUserTestToken(t, service)
+
+	if err := provider.CreateUser(option.User{Name: "sekai", Password: "password"}); err != nil {
+		t.Fatalf("prime user provider: %v", err)
+	}
+	if err := quotaService.ApplyConfig(option.TrafficQuotaUser{
+		Name:    "sekai",
+		QuotaGB: 1,
+		Period:  "daily",
+	}); err != nil {
+		t.Fatalf("prime quota service: %v", err)
+	}
+	if err := speedService.ApplyConfig(option.SpeedLimiterUser{
+		Name:         "sekai",
+		UploadMbps:   5,
+		DownloadMbps: 10,
+	}); err != nil {
+		t.Fatalf("prime speed service: %v", err)
+	}
+
+	recorder := performAdminAPIRequest(service, http.MethodPost, service.basePath+"/user/delete", `{"user":"sekai","purge_limits":true}`, token)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	if len(provider.deleted) != 0 {
+		t.Fatalf("expected user delete to be skipped on cleanup failure, got %#v", provider.deleted)
+	}
+	if _, ok := quotaService.QuotaStatus("sekai"); !ok {
+		t.Fatal("expected quota state to remain for sekai")
+	}
+	if _, _, ok := speedService.CurrentSpeed("sekai"); !ok {
+		t.Fatal("expected speed state to remain for sekai")
 	}
 }
 
@@ -452,18 +538,25 @@ func TestAdminAPIUserProviderErrorMapping(t *testing.T) {
 	}
 }
 
-func newAdminAPIUserTestService(t *testing.T, routePath string, provider *stubUserProvider) *Service {
+func newAdminAPIUserTestService(t *testing.T, routePath string, managedServices ...adapter.Service) *Service {
 	t.Helper()
 
-	service, err := NewService(option.AdminAPIServiceOptions{
+	manager := &stubAdminAPIServiceManager{services: managedServices}
+	ctx := singservice.ContextWith[adapter.ServiceManager](context.Background(), manager)
+
+	rawService, err := NewService(ctx, log.NewNOPFactory().Logger(), "admin", option.AdminAPIServiceOptions{
 		Path:        routePath,
 		TokenSecret: "super-secret",
 		Admins: []option.AdminCredential{
 			{Username: "alice", Password: "wonderland"},
 		},
-	}, provider)
+	})
 	if err != nil {
 		t.Fatalf("NewService returned error: %v", err)
+	}
+	service, ok := rawService.(*Service)
+	if !ok {
+		t.Fatalf("unexpected admin-api service type: %T", rawService)
 	}
 	service.authenticator.now = func() time.Time {
 		return time.Unix(1_700_000_000, 0)
@@ -499,15 +592,40 @@ func newAdminAPIUserSpeedService(t *testing.T) *speedlimiter.Service {
 	return service
 }
 
-func setAdminAPIRuntimeControllers(service *Service, quotaService *trafficquota.Service, speedService *speedlimiter.Service) {
-	setter := reflect.ValueOf(service).MethodByName("SetRuntimeControllers")
-	if !setter.IsValid() {
-		return
+type failingScheduleSpeedService struct {
+	*speedlimiter.Service
+	replaceErr error
+}
+
+func newAdminAPIFailingScheduleSpeedService(t *testing.T, replaceErr error) *failingScheduleSpeedService {
+	t.Helper()
+
+	return &failingScheduleSpeedService{
+		Service:    newAdminAPIUserSpeedService(t),
+		replaceErr: replaceErr,
 	}
-	setter.Call([]reflect.Value{
-		reflect.ValueOf(quotaService),
-		reflect.ValueOf(speedService),
-	})
+}
+
+func (s *failingScheduleSpeedService) ReplaceUserSchedules(user string, schedules []speedlimiter.UserSchedule) error {
+	return s.replaceErr
+}
+
+type failingRemoveQuotaService struct {
+	*trafficquota.Service
+	removeErr error
+}
+
+func newAdminAPIFailingRemoveQuotaService(t *testing.T, removeErr error) *failingRemoveQuotaService {
+	t.Helper()
+
+	return &failingRemoveQuotaService{
+		Service:   newAdminAPIUserQuotaService(t),
+		removeErr: removeErr,
+	}
+}
+
+func (s *failingRemoveQuotaService) RemoveConfig(user string) error {
+	return s.removeErr
 }
 
 func loginAdminAPIUserTestToken(t *testing.T, service *Service) string {
@@ -541,4 +659,37 @@ func performAdminAPIRequest(service *Service, method string, requestPath string,
 	recorder := httptest.NewRecorder()
 	service.ServeHTTP(recorder, request)
 	return recorder
+}
+
+type stubAdminAPIServiceManager struct {
+	services []adapter.Service
+}
+
+func (m *stubAdminAPIServiceManager) Start(stage adapter.StartStage) error {
+	return nil
+}
+
+func (m *stubAdminAPIServiceManager) Close() error {
+	return nil
+}
+
+func (m *stubAdminAPIServiceManager) Services() []adapter.Service {
+	return append([]adapter.Service(nil), m.services...)
+}
+
+func (m *stubAdminAPIServiceManager) Get(tag string) (adapter.Service, bool) {
+	for _, managedService := range m.services {
+		if managedService.Tag() == tag {
+			return managedService, true
+		}
+	}
+	return nil, false
+}
+
+func (m *stubAdminAPIServiceManager) Remove(tag string) error {
+	return errors.New("not implemented")
+}
+
+func (m *stubAdminAPIServiceManager) Create(ctx context.Context, logger log.ContextLogger, tag string, serviceType string, options any) error {
+	return errors.New("not implemented")
 }

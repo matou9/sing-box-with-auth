@@ -96,6 +96,10 @@ func (s *Service) RemoveConfig(user string) error {
 	return s.manager.RemoveConfig(user)
 }
 
+func (s *Service) GetConfig(user string) (option.TrafficQuotaUser, bool) {
+	return s.manager.GetConfig(user)
+}
+
 func (s *Service) QuotaStatus(user string) (Status, bool) {
 	return s.manager.Status(user)
 }

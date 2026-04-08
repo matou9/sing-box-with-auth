@@ -69,6 +69,10 @@ func (s *Service) RemoveConfig(user string) error {
 	return s.manager.RemoveConfig(user)
 }
 
+func (s *Service) GetConfig(user string) (option.SpeedLimiterUser, bool) {
+	return s.manager.GetConfig(user)
+}
+
 func (s *Service) CurrentSpeed(user string) (int, int, bool) {
 	return s.manager.CurrentSpeed(user)
 }

@@ -1,18 +1,28 @@
 package adminapi
 
 import (
+	"context"
 	"net/http"
 	"path"
 	"strings"
 
 	"github.com/sagernet/sing-box/adapter"
+	boxService "github.com/sagernet/sing-box/adapter/service"
+	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/service/speedlimiter"
+	"github.com/sagernet/sing-box/service/trafficquota"
+	singservice "github.com/sagernet/sing/service"
 
 	"github.com/go-chi/chi/v5"
 )
 
 const defaultBasePath = "/admin/v1"
+
+func RegisterService(registry *boxService.Registry) {
+	boxService.Register[option.AdminAPIServiceOptions](registry, C.TypeAdminAPI, NewService)
+}
 
 type UserProvider interface {
 	ListUsers() []adapter.User
@@ -25,16 +35,24 @@ type UserProvider interface {
 type QuotaController interface {
 	ApplyConfig(user option.TrafficQuotaUser) error
 	RemoveConfig(user string) error
+	GetConfig(user string) (option.TrafficQuotaUser, bool)
+	QuotaStatus(user string) (trafficquota.Status, bool)
 }
 
 type SpeedController interface {
 	ApplyConfig(user option.SpeedLimiterUser) error
 	RemoveConfig(user string) error
+	GetConfig(user string) (option.SpeedLimiterUser, bool)
 	ReplaceUserSchedules(user string, schedules []speedlimiter.UserSchedule) error
+	GetUserSchedules(user string) ([]speedlimiter.UserSchedule, bool)
 	RemoveUserSchedules(user string) error
 }
 
 type Service struct {
+	boxService.Adapter
+	ctx             context.Context
+	logger          log.ContextLogger
+	serviceManager  adapter.ServiceManager
 	authenticator   *Authenticator
 	userProvider    UserProvider
 	quotaController QuotaController
@@ -43,36 +61,77 @@ type Service struct {
 	router          http.Handler
 }
 
-func NewService(options option.AdminAPIServiceOptions, userProvider UserProvider) (*Service, error) {
+func NewService(ctx context.Context, logger log.ContextLogger, tag string, options option.AdminAPIServiceOptions) (adapter.Service, error) {
 	authenticator, err := NewAuthenticator(options)
 	if err != nil {
 		return nil, err
 	}
-	service := &Service{
-		authenticator: authenticator,
-		userProvider:  userProvider,
-		basePath:      normalizeBasePath(options.Path),
+	svc := &Service{
+		Adapter:        boxService.NewAdapter(C.TypeAdminAPI, tag),
+		ctx:            ctx,
+		logger:         logger,
+		serviceManager: singservice.FromContext[adapter.ServiceManager](ctx),
+		authenticator:  authenticator,
+		basePath:       normalizeBasePath(options.Path),
 	}
 	router := chi.NewRouter()
-	router.Route(service.basePath, func(baseRouter chi.Router) {
+	router.Route(svc.basePath, func(baseRouter chi.Router) {
 		baseRouter.Handle("/auth/login", postOnly(http.HandlerFunc(authenticator.LoginHandler)))
-		baseRouter.Handle("/user/list", service.authenticatedPost(http.HandlerFunc(service.ListUsersHandler)))
-		baseRouter.Handle("/user/get", service.authenticatedPost(http.HandlerFunc(service.GetUserHandler)))
-		baseRouter.Handle("/user/create", service.authenticatedPost(http.HandlerFunc(service.CreateUserHandler)))
-		baseRouter.Handle("/user/update", service.authenticatedPost(http.HandlerFunc(service.UpdateUserHandler)))
-		baseRouter.Handle("/user/delete", service.authenticatedPost(http.HandlerFunc(service.DeleteUserHandler)))
+		baseRouter.Handle("/user/list", svc.authenticatedPost(http.HandlerFunc(svc.ListUsersHandler)))
+		baseRouter.Handle("/user/get", svc.authenticatedPost(http.HandlerFunc(svc.GetUserHandler)))
+		baseRouter.Handle("/user/create", svc.authenticatedPost(http.HandlerFunc(svc.CreateUserHandler)))
+		baseRouter.Handle("/user/update", svc.authenticatedPost(http.HandlerFunc(svc.UpdateUserHandler)))
+		baseRouter.Handle("/user/delete", svc.authenticatedPost(http.HandlerFunc(svc.DeleteUserHandler)))
 	})
-	service.router = router
-	return service, nil
+	svc.router = router
+	return svc, nil
 }
 
-func (s *Service) SetRuntimeControllers(quotaController QuotaController, speedController SpeedController) {
-	s.quotaController = quotaController
-	s.speedController = speedController
+func (s *Service) Start(stage adapter.StartStage) error {
+	if stage == adapter.StartStateInitialize {
+		s.resolveManagedServices()
+	}
+	return nil
+}
+
+func (s *Service) Close() error {
+	return nil
 }
 
 func (s *Service) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	s.router.ServeHTTP(writer, request)
+}
+
+func (s *Service) resolveManagedServices() {
+	if s.serviceManager == nil {
+		return
+	}
+	var userProvider UserProvider
+	var quotaController QuotaController
+	var speedController SpeedController
+	for _, managedService := range s.serviceManager.Services() {
+		if managedService == s {
+			continue
+		}
+		if userProvider == nil {
+			if candidate, ok := managedService.(UserProvider); ok {
+				userProvider = candidate
+			}
+		}
+		if quotaController == nil {
+			if candidate, ok := managedService.(QuotaController); ok {
+				quotaController = candidate
+			}
+		}
+		if speedController == nil {
+			if candidate, ok := managedService.(SpeedController); ok {
+				speedController = candidate
+			}
+		}
+	}
+	s.userProvider = userProvider
+	s.quotaController = quotaController
+	s.speedController = speedController
 }
 
 func normalizeBasePath(rawPath string) string {
