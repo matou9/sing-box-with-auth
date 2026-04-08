@@ -1,0 +1,65 @@
+{
+  
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+    },
+    {
+      "type": "http",
+      "tag": "http-in",
+      "listen": "127.0.0.1",
+      "listen_port": 1081
+    }
+  ],
+
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "proxy",
+      "outbounds": ["auto", "vless-alice", "vless-charlie", "direct"],
+      "default": "auto"
+    },
+    {
+      "type": "urltest",
+      "tag": "auto",
+      "outbounds": ["vless-alice", "vless-charlie"],
+      "url": "http://connectivitycheck.platform.hicloud.com/generate_204",
+      "interval": "3m"
+    },
+    {
+      "type": "vless",
+      "tag": "vless-alice",
+      "server": "127.0.0.1",
+      "server_port": 15001,
+      "uuid": "ddf1c1ad-3f74-4f4a-913a-e6ab345c7edc"
+    },
+    {
+      "type": "vless",
+      "tag": "vless-charlie",
+      "server": "127.0.0.1",
+      "server_port": 15001,
+      "uuid": "cccccccc-cccc-cccc-cccc-cccccccccccc"
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+
+  "route": {
+    "rules": [
+      { "action": "sniff" },
+      { "ip_is_private": true, "outbound": "direct" }
+    ],
+    "final": "proxy"
+  }
+}
+

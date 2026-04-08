@@ -1,0 +1,315 @@
+{
+  "_readme": "sing-box-with-auth 服务端完整模板 — 覆盖 user-provider / speed-limiter / traffic-quota / admin-api 所有功能",
+
+  "log": {
+    "level": "info",
+    "output": "server.log",
+    "timestamp": true
+  },
+
+  "inbounds": [
+    {
+      "_comment": "VLESS+WebSocket 入站：UUID 认证由 user-provider 接管，users 留空",
+      "type": "vless",
+      "tag": "vless-ws-in",
+      "listen": "0.0.0.0",
+      "listen_port": 443,
+      "users": [],
+      "tls": {
+        "enabled": true,
+        "server_name": "yourdomain.com",
+        "certificate_path": "/etc/sing-box/cert.pem",
+        "key_path": "/etc/sing-box/key.pem"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/vless-ws"
+      }
+    },
+    {
+      "_comment": "Shadowsocks 入站：密码认证由 user-provider 接管，users 留空",
+      "type": "shadowsocks",
+      "tag": "ss-in",
+      "listen": "0.0.0.0",
+      "listen_port": 8388,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "SERVER_BASE64_PASSWORD_HERE",
+      "users": []
+    },
+    {
+      "_comment": "Trojan 入站示例（可选）",
+      "type": "trojan",
+      "tag": "trojan-in",
+      "listen": "0.0.0.0",
+      "listen_port": 8443,
+      "users": [],
+      "tls": {
+        "enabled": true,
+        "server_name": "yourdomain.com",
+        "certificate_path": "/etc/sing-box/cert.pem",
+        "key_path": "/etc/sing-box/key.pem"
+      }
+    }
+  ],
+
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+
+  "route": {
+    "rules": [
+      { "action": "sniff" },
+      { "protocol": "dns", "action": "hijack-dns" },
+      { "ip_is_private": true, "outbound": "direct" }
+    ],
+    "final": "direct"
+  },
+
+  "services": [
+
+    {
+      "_comment": "===== user-provider：统一管理多个入站的用户，支持静态/文件/HTTP/Postgres/Redis 多源 =====",
+      "type": "user-provider",
+      "tag": "user-provider",
+      "inbounds": ["vless-ws-in", "ss-in", "trojan-in"],
+
+      "users": [
+        {
+          "_comment": "alice：VLESS 使用 uuid，Shadowsocks/Trojan 使用 password",
+          "name": "alice",
+          "uuid": "ddf1c1ad-3f74-4f4a-913a-e6ab345c7edc",
+          "password": "alice-ss-password"
+        },
+        {
+          "name": "bob",
+          "uuid": "aaaabbbb-cccc-dddd-eeee-ffffffffffff",
+          "password": "bob-ss-password"
+        },
+        {
+          "_comment": "premium 组用户",
+          "name": "charlie",
+          "uuid": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+          "password": "charlie-ss-password"
+        }
+      ],
+
+      "file": {
+        "_comment": "从 JSON 文件加载用户，支持热重载",
+        "path": "/etc/sing-box/users.json",
+        "update_interval": "60s"
+      },
+
+      "http": {
+        "_comment": "从 HTTP 接口拉取用户列表（JSON 数组格式）",
+        "url": "https://your-api.example.com/api/users",
+        "update_interval": "60s"
+      },
+
+      "postgres": {
+        "_comment": "从 Postgres 数据库加载用户，支持 LISTEN/NOTIFY 实时推送",
+        "connection_string": "postgres://user:password@localhost:5432/singbox?sslmode=disable",
+        "table": "users",
+        "notify_channel": "sing_box_users",
+        "update_interval": "300s"
+      },
+
+      "redis": {
+        "_comment": "从 Redis Hash 加载用户，支持 Pub/Sub 实时推送",
+        "address": "localhost:6379",
+        "password": "redis-password",
+        "db": 0,
+        "key": "sing-box:users",
+        "channel": "sing-box:users:updates",
+        "update_interval": "60s"
+      }
+    },
+
+    {
+      "_comment": "===== speed-limiter：按用户/组/时间段限制上传下载速率 =====",
+      "type": "speed-limiter",
+      "tag": "speed-limiter",
+
+      "default": {
+        "_comment": "未匹配任何用户/组时的兜底限速（0 = 不限）",
+        "upload_mbps": 50,
+        "download_mbps": 50
+      },
+
+      "groups": [
+        {
+          "name": "premium",
+          "upload_mbps": 500,
+          "download_mbps": 500
+        },
+        {
+          "name": "basic",
+          "upload_mbps": 10,
+          "download_mbps": 10
+        }
+      ],
+
+      "users": [
+        {
+          "_comment": "alice 属于 premium 组（继承组速率），也可单独覆盖",
+          "name": "alice",
+          "group": "premium"
+        },
+        {
+          "name": "bob",
+          "group": "basic"
+        },
+        {
+          "_comment": "charlie 不属于任何组，单独指定速率",
+          "name": "charlie",
+          "upload_mbps": 100,
+          "download_mbps": 200
+        }
+      ],
+
+      "schedules": [
+        {
+          "_comment": "全局调度：凌晨 00:00-06:00 不限速（享受低峰带宽）",
+          "time_range": "00:00-06:00",
+          "upload_mbps": 0,
+          "download_mbps": 0
+        },
+        {
+          "_comment": "高峰期 18:00-23:00，premium 组限速 200Mbps",
+          "time_range": "18:00-23:00",
+          "upload_mbps": 200,
+          "download_mbps": 200,
+          "groups": ["premium"]
+        },
+        {
+          "_comment": "高峰期 basic 组限 5Mbps",
+          "time_range": "18:00-23:00",
+          "upload_mbps": 5,
+          "download_mbps": 5,
+          "groups": ["basic"]
+        }
+      ],
+
+      "dynamic": {
+        "_comment": "运行时动态下发限速配置（通过 admin-api 也可调，这里配置自动同步源）",
+        "postgres": {
+          "connection_string": "postgres://user:password@localhost:5432/singbox?sslmode=disable",
+          "table": "speed_limits",
+          "notify_channel": "sing_box_speed",
+          "update_interval": "300s"
+        },
+        "redis": {
+          "address": "localhost:6379",
+          "password": "redis-password",
+          "db": 0,
+          "hash_key": "sing-box:speed-config",
+          "channel": "sing-box:speed:updates",
+          "update_interval": "60s"
+        }
+      }
+    },
+
+    {
+      "_comment": "===== traffic-quota：按用户/组限制周期流量，超限断连 =====",
+      "type": "traffic-quota",
+      "tag": "traffic-quota",
+
+      "groups": [
+        {
+          "name": "premium",
+          "quota_gb": 1000,
+          "period": "monthly",
+          "period_start": "1"
+        },
+        {
+          "name": "basic",
+          "quota_gb": 10,
+          "period": "monthly",
+          "period_start": "1"
+        }
+      ],
+
+      "users": [
+        {
+          "name": "alice",
+          "group": "premium"
+        },
+        {
+          "name": "bob",
+          "group": "basic"
+        },
+        {
+          "_comment": "charlie 自定义：50GB，每月1日重置",
+          "name": "charlie",
+          "quota_gb": 50,
+          "period": "monthly",
+          "period_start": "1"
+        }
+      ],
+
+      "persistence": {
+        "_comment": "Redis 持久化（优先），断线重启后流量不丢失；也可改用 postgres",
+        "redis": {
+          "address": "localhost:6379",
+          "password": "redis-password",
+          "db": 1,
+          "key_prefix": "sing-box:quota:"
+        }
+      },
+
+      "flush_interval": "30s",
+
+      "dynamic": {
+        "_comment": "运行时动态下发配额配置",
+        "postgres": {
+          "connection_string": "postgres://user:password@localhost:5432/singbox?sslmode=disable",
+          "table": "traffic_quotas",
+          "notify_channel": "sing_box_quota",
+          "update_interval": "300s"
+        },
+        "redis": {
+          "address": "localhost:6379",
+          "password": "redis-password",
+          "db": 0,
+          "hash_key": "sing-box:quota-config",
+          "channel": "sing-box:quota:updates",
+          "update_interval": "60s"
+        }
+      }
+    },
+
+    {
+      "_comment": "===== admin-api：HTTP 控制平面，运行时管理用户/配额/限速/调度 =====",
+      "type": "admin-api",
+      "tag": "admin-api",
+      "listen": "127.0.0.1:9090",
+      "path": "/admin/v1",
+
+      "token_secret": "CHANGE_ME_STRONG_RANDOM_SECRET_32CHARS",
+      "token_ttl": "24h",
+
+      "tokens": [
+        "STATIC_BEARER_TOKEN_FOR_SCRIPTS"
+      ],
+
+      "admins": [
+        {
+          "username": "admin",
+          "password": "CHANGE_ME_STRONG_PASSWORD"
+        },
+        {
+          "_comment": "可添加多个管理员账号",
+          "username": "ops",
+          "password": "ops-password"
+        }
+      ]
+    }
+
+  ]
+}

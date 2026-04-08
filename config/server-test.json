@@ -1,0 +1,86 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-in",
+      "listen": "127.0.0.1",
+      "listen_port": 15001,
+      "users": []
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "block",  "tag": "block"  }
+  ],
+  "route": {
+    "rules": [
+      { "action": "sniff" },
+      { "ip_is_private": true, "outbound": "direct" }
+    ],
+    "final": "direct"
+  },
+  "services": [
+    {
+      "type": "user-provider",
+      "tag": "user-provider",
+      "inbounds": ["vless-in"],
+      "users": [
+        { "name": "alice",   "uuid": "ddf1c1ad-3f74-4f4a-913a-e6ab345c7edc" },
+        { "name": "bob",     "uuid": "aaaabbbb-cccc-dddd-eeee-ffffffffffff" },
+        { "name": "charlie", "uuid": "cccccccc-cccc-cccc-cccc-cccccccccccc" }
+      ]
+    },
+    {
+      "type": "speed-limiter",
+      "tag": "speed-limiter",
+      "default": { "upload_mbps": 20, "download_mbps": 20 },
+      "groups": [
+        { "name": "premium", "upload_mbps": 200, "download_mbps": 200 },
+        { "name": "basic",   "upload_mbps": 5,   "download_mbps": 5   }
+      ],
+      "users": [
+        { "name": "alice",   "group": "premium" },
+        { "name": "bob",     "group": "basic"   },
+        { "name": "charlie", "upload_mbps": 50, "download_mbps": 100 }
+      ],
+      "schedules": [
+        {
+          "time_range": "00:00-23:59",
+          "upload_mbps": 0,
+          "download_mbps": 0,
+          "groups": ["premium"]
+        }
+      ]
+    },
+    {
+      "type": "traffic-quota",
+      "tag": "traffic-quota",
+      "groups": [
+        { "name": "premium", "quota_gb": 1000, "period": "monthly", "period_start": "2026-04-01" },
+        { "name": "basic",   "quota_gb": 10,   "period": "monthly", "period_start": "2026-04-01" }
+      ],
+      "users": [
+        { "name": "alice",   "group": "premium" },
+        { "name": "bob",     "group": "basic"   },
+        { "name": "charlie", "quota_gb": 50, "period": "monthly", "period_start": "2026-04-01" }
+      ],
+      "flush_interval": "10s"
+    },
+    {
+      "type": "admin-api",
+      "tag": "admin-api",
+      "listen": "127.0.0.1:9091",
+      "path": "/admin/v1",
+      "token_secret": "test-secret-key-32chars-longxxxx",
+      "token_ttl": "24h",
+      "tokens": ["test-token"],
+      "admins": [
+        { "username": "admin", "password": "admin123" }
+      ]
+    }
+  ]
+}

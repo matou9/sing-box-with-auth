@@ -139,5 +139,8 @@ func (s *RedisSource) doSubscribe(ctx context.Context, onUpdate func()) error {
 }
 
 func (s *RedisSource) Close() error {
+	if s == nil {
+		return nil
+	}
 	return s.client.Close()
 }

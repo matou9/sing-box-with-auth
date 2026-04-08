@@ -158,6 +158,9 @@ func (s *PostgresSource) doListen(ctx context.Context, onUpdate func()) error {
 }
 
 func (s *PostgresSource) Close() error {
+	if s == nil {
+		return nil
+	}
 	if s.pool != nil {
 		s.pool.Close()
 	}

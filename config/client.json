@@ -1,0 +1,247 @@
+{
+  "_readme": "sing-box-with-auth 客户端完整模板 — 基于 gcvip0403.json 风格，覆盖 TUN/混合入站、多出站选择、Geo 路由、DNS 分流",
+
+  "log": {
+    "level": "info",
+    "output": "client.log",
+    "timestamp": true
+  },
+
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "dns-remote",
+        "server": "8.8.8.8",
+        "detour": "proxy"
+      },
+      {
+        "type": "udp",
+        "tag": "dns-local",
+        "server": "223.5.5.5",
+        "detour": "direct"
+      },
+      {
+        "type": "fakeip",
+        "tag": "dns-fakeip",
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
+      }
+    ],
+    "rules": [
+      {
+        "_comment": "屏蔽 HTTPS/SVCB DNS 查询（减少不必要的流量）",
+        "action": "predefined",
+        "rcode": "NOTIMP",
+        "query_type": [64, 65]
+      },
+      {
+        "_comment": "服务端域名走远端 DNS",
+        "domain_suffix": [".yourdomain.com"],
+        "server": "dns-remote"
+      },
+      {
+        "_comment": "国内域名走本地 DNS",
+        "rule_set": "GeoSite-CN",
+        "server": "dns-local"
+      },
+      {
+        "_comment": "非国内域名走远端 DNS（防污染）",
+        "rule_set": "GeoLocation-!CN",
+        "server": "dns-remote"
+      }
+    ],
+    "final": "dns-remote",
+    "strategy": "prefer_ipv4"
+  },
+
+  "inbounds": [
+    {
+      "_comment": "TUN 虚拟网卡：全局透明代理，需 root/管理员权限",
+      "type": "tun",
+      "tag": "tun-in",
+      "mtu": 9000,
+      "address": "172.19.0.1/28",
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "gvisor",
+      "domain_strategy": "prefer_ipv4",
+      "exclude_package": [
+        "_comment_exclude_your_app_package_name_here"
+      ]
+    },
+    {
+      "_comment": "HTTP+SOCKS5 混合代理入站（浏览器/工具手动配置）",
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 7890,
+      "set_system_proxy": false
+    },
+    {
+      "_comment": "HTTP 代理（仅 HTTP，兼容旧工具）",
+      "type": "http",
+      "tag": "http-in",
+      "listen": "127.0.0.1",
+      "listen_port": 7891,
+      "set_system_proxy": false
+    }
+  ],
+
+  "outbounds": [
+    {
+      "_comment": "===== 主选择器：手动选择出口线路 =====",
+      "type": "selector",
+      "tag": "proxy",
+      "outbounds": [
+        "auto",
+        "server-main",
+        "server-premium",
+        "server-game",
+        "direct"
+      ],
+      "default": "auto"
+    },
+
+    {
+      "_comment": "自动测速选择最快节点",
+      "type": "urltest",
+      "tag": "auto",
+      "outbounds": ["server-main", "server-premium", "server-game"],
+      "url": "http://connectivitycheck.platform.hicloud.com/generate_204",
+      "interval": "3m",
+      "tolerance": 50
+    },
+
+    {
+      "_comment": "===== 主线路：VLESS+WebSocket+TLS =====",
+      "type": "vless",
+      "tag": "server-main",
+      "server": "yourdomain.com",
+      "server_port": 443,
+      "uuid": "ddf1c1ad-3f74-4f4a-913a-e6ab345c7edc",
+      "packet_encoding": "xudp",
+      "tls": {
+        "enabled": true,
+        "server_name": "yourdomain.com",
+        "insecure": false
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/vless-ws",
+        "headers": {
+          "Host": "yourdomain.com"
+        }
+      }
+    },
+
+    {
+      "_comment": "精品线路：VLESS+WebSocket+TLS（备用域名/高优先级 IP）",
+      "type": "vless",
+      "tag": "server-premium",
+      "server": "premium.yourdomain.com",
+      "server_port": 443,
+      "uuid": "ddf1c1ad-3f74-4f4a-913a-e6ab345c7edc",
+      "packet_encoding": "xudp",
+      "tls": {
+        "enabled": true,
+        "server_name": "premium.yourdomain.com",
+        "insecure": false
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/vless-ws"
+      }
+    },
+
+    {
+      "_comment": "游戏专线：Shadowsocks（低延迟，适合游戏）",
+      "type": "shadowsocks",
+      "tag": "server-game",
+      "server": "game.yourdomain.com",
+      "server_port": 8388,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "SERVER_BASE64_PASSWORD_HERE:USER_BASE64_PASSWORD_HERE"
+    },
+
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    },
+    {
+      "type": "dns",
+      "tag": "dns-out"
+    }
+  ],
+
+  "route": {
+    "default_domain_resolver": {
+      "server": "dns-remote",
+      "rewrite_ttl": 60
+    },
+    "rule_set": [
+      {
+        "tag": "GeoIP-CN",
+        "type": "local",
+        "path": "geoip-cn.srs",
+        "format": "binary"
+      },
+      {
+        "tag": "GeoSite-CN",
+        "type": "local",
+        "path": "geosite-cn.srs",
+        "format": "binary"
+      },
+      {
+        "tag": "GeoLocation-!CN",
+        "type": "local",
+        "path": "geosite-geolocation-!cn.srs",
+        "format": "binary"
+      }
+    ],
+    "rules": [
+      { "action": "sniff" },
+      { "protocol": "dns", "outbound": "dns-out" },
+      {
+        "_comment": "私有地址直连",
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "_comment": "国内 IP/域名直连",
+        "rule_set": ["GeoIP-CN", "GeoSite-CN"],
+        "outbound": "direct"
+      },
+      {
+        "_comment": "服务端域名直连（防回路）",
+        "domain_suffix": [".yourdomain.com"],
+        "outbound": "direct"
+      },
+      {
+        "_comment": "HTTP 入站流量直接出（不走代理）",
+        "inbound": ["http-in"],
+        "outbound": "direct"
+      }
+    ],
+    "final": "proxy",
+    "auto_detect_interface": true
+  },
+
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "path": "clash.db",
+      "cache_id": "sing-box-client"
+    },
+    "clash_api": {
+      "_comment": "可选：启用 Clash API 兼容接口，用于 Yacd/MetaCubeX 等面板",
+      "external_controller": "127.0.0.1:9091",
+      "external_ui": "ui",
+      "secret": "clash-api-secret"
+    }
+  }
+}
