@@ -215,3 +215,89 @@ func TestManagerRemoveUserSchedulesEvictsRuntimeOnlyLimiter(t *testing.T) {
 		t.Fatal("expected limiter eviction for runtime-only user after schedule removal")
 	}
 }
+
+func TestManagerCachedLimiterCreatesUploadDirectionWhenScheduleActivates(t *testing.T) {
+	opts := option.SpeedLimiterServiceOptions{
+		Users: []option.SpeedLimiterUser{
+			{Name: "download-only", DownloadMbps: 10},
+		},
+	}
+	m, err := NewLimiterManager(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.now = func() time.Time { return timeAt(19, 0) }
+
+	ul := m.GetOrCreateLimiter("download-only")
+	if ul == nil {
+		t.Fatal("expected limiter for download-only user")
+	}
+	if ul.Upload != nil {
+		t.Fatal("expected upload limiter to start nil")
+	}
+	assertRate(t, "download-only base download", ul.Download, 10)
+
+	if err := m.ReplaceUserSchedules("download-only", []UserSchedule{
+		{
+			TimeRange:    "18:00-23:00",
+			UploadMbps:   25,
+			DownloadMbps: 40,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if ul.Upload == nil {
+		t.Fatal("expected upload limiter to be created when runtime schedule enables upload")
+	}
+	assertRate(t, "download-only upload during schedule", ul.Upload, 25)
+	assertRate(t, "download-only download stays fixed", ul.Download, 10)
+}
+
+func TestManagerCachedLimiterRemovesUploadDirectionWhenFallbackHitsZero(t *testing.T) {
+	opts := option.SpeedLimiterServiceOptions{
+		Users: []option.SpeedLimiterUser{
+			{Name: "download-only", DownloadMbps: 10},
+		},
+	}
+	m, err := NewLimiterManager(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.now = func() time.Time { return timeAt(19, 0) }
+
+	ul := m.GetOrCreateLimiter("download-only")
+	if ul == nil {
+		t.Fatal("expected limiter for download-only user")
+	}
+
+	if err := m.ReplaceUserSchedules("download-only", []UserSchedule{
+		{
+			TimeRange:    "18:00-23:00",
+			UploadMbps:   25,
+			DownloadMbps: 40,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ul.Upload == nil {
+		t.Fatal("expected upload limiter during runtime schedule")
+	}
+
+	if err := m.RemoveUserSchedules("download-only"); err != nil {
+		t.Fatal(err)
+	}
+
+	if ul.Upload != nil {
+		t.Fatal("expected upload limiter to be removed when fallback upload is 0")
+	}
+	assertRate(t, "download-only download after fallback", ul.Download, 10)
+
+	uploadMbps, downloadMbps, ok := m.CurrentSpeed("download-only")
+	if !ok {
+		t.Fatal("expected current speed for download-only user")
+	}
+	if uploadMbps != 0 || downloadMbps != 10 {
+		t.Fatalf("current speed after fallback = %d/%d, want 0/10", uploadMbps, downloadMbps)
+	}
+}

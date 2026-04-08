@@ -388,11 +388,10 @@ func (m *LimiterManager) updateLimiterRatesLocked(now time.Time) {
 			delete(m.limiters, userName)
 			continue
 		}
-		if limiter.Upload != nil && cfg.UploadMbps > 0 {
-			SetLimiterRate(limiter.Upload, cfg.UploadMbps)
-		}
-		if limiter.Download != nil && cfg.DownloadMbps > 0 {
-			SetLimiterRate(limiter.Download, cfg.DownloadMbps)
+		reconcileLimiterDirection(&limiter.Upload, cfg.UploadMbps)
+		reconcileLimiterDirection(&limiter.Download, cfg.DownloadMbps)
+		if limiter.Upload == nil && limiter.Download == nil {
+			delete(m.limiters, userName)
 		}
 	}
 }
@@ -496,5 +495,16 @@ func (e scheduleEntry) toUserSchedule() UserSchedule {
 		TimeRange:    fmt.Sprintf("%02d:%02d-%02d:%02d", e.startHour, e.startMin, e.endHour, e.endMin),
 		UploadMbps:   e.uploadMbps,
 		DownloadMbps: e.downloadMbps,
+	}
+}
+
+func reconcileLimiterDirection(limiter **rate.Limiter, mbps int) {
+	switch {
+	case mbps > 0 && *limiter == nil:
+		*limiter = NewLimiter(mbps)
+	case mbps > 0:
+		SetLimiterRate(*limiter, mbps)
+	default:
+		*limiter = nil
 	}
 }
