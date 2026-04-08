@@ -83,6 +83,23 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	return nil
 }
 
+func (s *Service) ApplyConfig(user option.TrafficQuotaUser) error {
+	return s.manager.ApplyConfig(user)
+}
+
+func (s *Service) RemoveConfig(user string) error {
+	if s.persister != nil && s.manager.HasQuota(user) {
+		if err := s.persister.Delete(user, s.manager.CurrentPeriodKey(user)); err != nil {
+			return err
+		}
+	}
+	return s.manager.RemoveConfig(user)
+}
+
+func (s *Service) QuotaStatus(user string) (Status, bool) {
+	return s.manager.Status(user)
+}
+
 func (s *Service) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
 	if metadata.User == "" || !s.manager.HasQuota(metadata.User) {
 		return conn

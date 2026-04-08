@@ -7,6 +7,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/service/speedlimiter"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -21,11 +22,25 @@ type UserProvider interface {
 	DeleteUser(name string) error
 }
 
+type QuotaController interface {
+	ApplyConfig(user option.TrafficQuotaUser) error
+	RemoveConfig(user string) error
+}
+
+type SpeedController interface {
+	ApplyConfig(user option.SpeedLimiterUser) error
+	RemoveConfig(user string) error
+	ReplaceUserSchedules(user string, schedules []speedlimiter.UserSchedule) error
+	RemoveUserSchedules(user string) error
+}
+
 type Service struct {
-	authenticator *Authenticator
-	userProvider  UserProvider
-	basePath      string
-	router        http.Handler
+	authenticator   *Authenticator
+	userProvider    UserProvider
+	quotaController QuotaController
+	speedController SpeedController
+	basePath        string
+	router          http.Handler
 }
 
 func NewService(options option.AdminAPIServiceOptions, userProvider UserProvider) (*Service, error) {
@@ -49,6 +64,11 @@ func NewService(options option.AdminAPIServiceOptions, userProvider UserProvider
 	})
 	service.router = router
 	return service, nil
+}
+
+func (s *Service) SetRuntimeControllers(quotaController QuotaController, speedController SpeedController) {
+	s.quotaController = quotaController
+	s.speedController = speedController
 }
 
 func (s *Service) ServeHTTP(writer http.ResponseWriter, request *http.Request) {

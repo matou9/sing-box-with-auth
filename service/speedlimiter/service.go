@@ -61,6 +61,14 @@ func (s *Service) Close() error {
 	return nil
 }
 
+func (s *Service) ApplyConfig(user option.SpeedLimiterUser) error {
+	return s.manager.ApplyConfig(user)
+}
+
+func (s *Service) RemoveConfig(user string) error {
+	return s.manager.RemoveConfig(user)
+}
+
 func (s *Service) CurrentSpeed(user string) (int, int, bool) {
 	return s.manager.CurrentSpeed(user)
 }

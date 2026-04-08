@@ -46,6 +46,12 @@ type PeriodReset struct {
 	CurrentPeriod string
 }
 
+type Status struct {
+	UsageBytes int64
+	QuotaBytes int64
+	Exceeded   bool
+}
+
 type connList struct {
 	access sync.Mutex
 	conns  []quotaTrackedConn
@@ -168,6 +174,54 @@ func (m *QuotaManager) RegisterConn(user string, conn quotaTrackedConn) (func(in
 		}, func() {
 			connList.remove(conn)
 		}
+}
+
+func (m *QuotaManager) ApplyConfig(user option.TrafficQuotaUser) error {
+	if user.Name == "" {
+		return E.New("traffic-quota user missing name")
+	}
+	config, err := newQuotaConfig(user.QuotaGB, user.Period, user.PeriodStart, user.PeriodDays, nil)
+	if err != nil {
+		return E.Cause(err, "invalid traffic-quota user ", user.Name)
+	}
+	if config == nil {
+		return E.New("invalid traffic-quota user ", user.Name)
+	}
+	m.userConfigs[user.Name] = config
+	state := m.stateFor(user.Name)
+	state.setPeriodKeyIfEmpty(m.mustPeriodKey(user.Name, m.now()))
+	if state.usage.Load() > config.quotaBytes {
+		m.tripExceeded(user.Name, state)
+	} else {
+		state.exceeded.Store(false)
+	}
+	return nil
+}
+
+func (m *QuotaManager) RemoveConfig(user string) error {
+	if user == "" {
+		return E.New("traffic-quota user missing name")
+	}
+	delete(m.userConfigs, user)
+	m.activeConns.Delete(user)
+	m.states.Delete(user)
+	return nil
+}
+
+func (m *QuotaManager) Status(user string) (Status, bool) {
+	config, loaded := m.userConfigs[user]
+	if !loaded {
+		return Status{}, false
+	}
+	state, loaded := m.states.Load(user)
+	if !loaded {
+		return Status{QuotaBytes: config.quotaBytes}, true
+	}
+	return Status{
+		UsageBytes: state.usage.Load(),
+		QuotaBytes: config.quotaBytes,
+		Exceeded:   state.exceeded.Load(),
+	}, true
 }
 
 func (m *QuotaManager) HasQuota(user string) bool {

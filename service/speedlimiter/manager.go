@@ -21,9 +21,9 @@ type UserLimiter struct {
 
 // UserSchedule is a runtime per-user schedule rule.
 type UserSchedule struct {
-	TimeRange    string
-	UploadMbps   int
-	DownloadMbps int
+	TimeRange    string `json:"time_range"`
+	UploadMbps   int    `json:"upload_mbps,omitempty"`
+	DownloadMbps int    `json:"download_mbps,omitempty"`
 }
 
 // speedConfig holds resolved upload/download Mbps for a user.
@@ -164,6 +164,53 @@ func (m *LimiterManager) CurrentSpeed(userName string) (int, int, bool) {
 		return 0, 0, false
 	}
 	return cfg.UploadMbps, cfg.DownloadMbps, true
+}
+
+func (m *LimiterManager) ApplyConfig(user option.SpeedLimiterUser) error {
+	if user.Name == "" {
+		return fmt.Errorf("speed-limiter user missing name")
+	}
+	if user.Group != "" {
+		if _, ok := m.groups[user.Group]; !ok {
+			return fmt.Errorf("speed-limiter user %q references unknown group %q", user.Name, user.Group)
+		}
+	}
+	if user.Group == "" && user.UploadMbps <= 0 && user.DownloadMbps <= 0 {
+		return fmt.Errorf("speed-limiter user %q missing runtime speed", user.Name)
+	}
+
+	m.mu.Lock()
+	if user.Group == "" {
+		delete(m.userGroups, user.Name)
+	} else {
+		m.userGroups[user.Name] = user.Group
+	}
+	if user.UploadMbps > 0 || user.DownloadMbps > 0 {
+		m.userOverrides[user.Name] = &speedConfig{
+			UploadMbps:   user.UploadMbps,
+			DownloadMbps: user.DownloadMbps,
+		}
+	} else {
+		delete(m.userOverrides, user.Name)
+	}
+	userCopy := user
+	m.userRawConfig[user.Name] = &userCopy
+	m.applyRuntimeStateLocked(m.now())
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *LimiterManager) RemoveConfig(user string) error {
+	if user == "" {
+		return fmt.Errorf("speed-limiter user missing name")
+	}
+	m.mu.Lock()
+	delete(m.userGroups, user)
+	delete(m.userOverrides, user)
+	delete(m.userRawConfig, user)
+	m.applyRuntimeStateLocked(m.now())
+	m.mu.Unlock()
+	return nil
 }
 
 // resolveConfig determines the effective speed config for a user.

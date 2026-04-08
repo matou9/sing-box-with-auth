@@ -6,12 +6,16 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/service/speedlimiter"
+	"github.com/sagernet/sing-box/service/trafficquota"
 )
 
 type stubUpdateCall struct {
@@ -284,6 +288,120 @@ func TestAdminAPIUserRoutesWithBearerToken(t *testing.T) {
 	}
 }
 
+func TestAdminAPIUserCreateAppliesQuotaAndSpeed(t *testing.T) {
+	provider := &stubUserProvider{}
+	quotaService := newAdminAPIUserQuotaService(t)
+	speedService := newAdminAPIUserSpeedService(t)
+	service := newAdminAPIUserTestService(t, "", provider)
+	setAdminAPIRuntimeControllers(service, quotaService, speedService)
+	token := loginAdminAPIUserTestToken(t, service)
+
+	recorder := performAdminAPIRequest(service, http.MethodPost, service.basePath+"/user/create", `{
+		"user":{"name":"new-user","password":"create-password"},
+		"quota":{"quota_gb":1,"period":"daily"},
+		"speed":{"upload_mbps":5,"download_mbps":10},
+		"speed_schedules":[{"time_range":"08:00-18:00","upload_mbps":2,"download_mbps":4}]
+	}`, token)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	if len(provider.created) != 1 {
+		t.Fatalf("unexpected create calls: %d", len(provider.created))
+	}
+	if provider.created[0].Name != "new-user" {
+		t.Fatalf("unexpected created user: %#v", provider.created[0])
+	}
+
+	quotaStatus, ok := quotaService.QuotaStatus("new-user")
+	if !ok {
+		t.Fatal("expected quota config for new-user")
+	}
+	if quotaStatus.QuotaBytes != 1<<30 {
+		t.Fatalf("quota bytes = %d, want %d", quotaStatus.QuotaBytes, int64(1<<30))
+	}
+	if quotaStatus.UsageBytes != 0 || quotaStatus.Exceeded {
+		t.Fatalf("unexpected quota status: %+v", quotaStatus)
+	}
+
+	uploadMbps, downloadMbps, ok := speedService.CurrentSpeed("new-user")
+	if !ok {
+		t.Fatal("expected speed config for new-user")
+	}
+	if uploadMbps != 5 || downloadMbps != 10 {
+		t.Fatalf("current speed = %d/%d, want 5/10", uploadMbps, downloadMbps)
+	}
+
+	schedules, ok := speedService.GetUserSchedules("new-user")
+	if !ok {
+		t.Fatal("expected runtime schedules for new-user")
+	}
+	if len(schedules) != 1 {
+		t.Fatalf("schedule length = %d, want 1", len(schedules))
+	}
+	if schedules[0] != (speedlimiter.UserSchedule{
+		TimeRange:    "08:00-18:00",
+		UploadMbps:   2,
+		DownloadMbps: 4,
+	}) {
+		t.Fatalf("unexpected schedules: %+v", schedules)
+	}
+}
+
+func TestAdminAPIUserDeleteRemovesUserQuotaAndSchedules(t *testing.T) {
+	provider := &stubUserProvider{}
+	quotaService := newAdminAPIUserQuotaService(t)
+	speedService := newAdminAPIUserSpeedService(t)
+	service := newAdminAPIUserTestService(t, "", provider)
+	setAdminAPIRuntimeControllers(service, quotaService, speedService)
+	token := loginAdminAPIUserTestToken(t, service)
+
+	if err := provider.CreateUser(option.User{Name: "sekai", Password: "password"}); err != nil {
+		t.Fatalf("prime user provider: %v", err)
+	}
+	if err := quotaService.ApplyConfig(option.TrafficQuotaUser{
+		Name:    "sekai",
+		QuotaGB: 1,
+		Period:  "daily",
+	}); err != nil {
+		t.Fatalf("prime quota service: %v", err)
+	}
+	if err := speedService.ApplyConfig(option.SpeedLimiterUser{
+		Name:         "sekai",
+		UploadMbps:   5,
+		DownloadMbps: 10,
+	}); err != nil {
+		t.Fatalf("prime speed service: %v", err)
+	}
+	if err := speedService.ReplaceUserSchedules("sekai", []speedlimiter.UserSchedule{
+		{
+			TimeRange:    "08:00-18:00",
+			UploadMbps:   2,
+			DownloadMbps: 4,
+		},
+	}); err != nil {
+		t.Fatalf("prime speed schedules: %v", err)
+	}
+
+	recorder := performAdminAPIRequest(service, http.MethodPost, service.basePath+"/user/delete", `{"user":"sekai","purge_limits":true}`, token)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	if len(provider.deleted) != 1 || provider.deleted[0] != "sekai" {
+		t.Fatalf("unexpected delete calls: %#v", provider.deleted)
+	}
+	if _, ok := quotaService.QuotaStatus("sekai"); ok {
+		t.Fatal("expected quota state to be removed for sekai")
+	}
+	if _, _, ok := speedService.CurrentSpeed("sekai"); ok {
+		t.Fatal("expected speed config to be removed for sekai")
+	}
+	if _, ok := speedService.GetUserSchedules("sekai"); ok {
+		t.Fatal("expected runtime schedules to be removed for sekai")
+	}
+}
+
 func TestAdminAPIUserProviderErrorMapping(t *testing.T) {
 	testCases := []struct {
 		name       string
@@ -351,6 +469,45 @@ func newAdminAPIUserTestService(t *testing.T, routePath string, provider *stubUs
 		return time.Unix(1_700_000_000, 0)
 	}
 	return service
+}
+
+func newAdminAPIUserQuotaService(t *testing.T) *trafficquota.Service {
+	t.Helper()
+
+	rawService, err := trafficquota.NewService(context.Background(), log.NewNOPFactory().Logger(), "quota", option.TrafficQuotaServiceOptions{})
+	if err != nil {
+		t.Fatalf("new quota service: %v", err)
+	}
+	service, ok := rawService.(*trafficquota.Service)
+	if !ok {
+		t.Fatalf("unexpected quota service type: %T", rawService)
+	}
+	return service
+}
+
+func newAdminAPIUserSpeedService(t *testing.T) *speedlimiter.Service {
+	t.Helper()
+
+	rawService, err := speedlimiter.NewService(context.Background(), log.NewNOPFactory().Logger(), "speed", option.SpeedLimiterServiceOptions{})
+	if err != nil {
+		t.Fatalf("new speed service: %v", err)
+	}
+	service, ok := rawService.(*speedlimiter.Service)
+	if !ok {
+		t.Fatalf("unexpected speed service type: %T", rawService)
+	}
+	return service
+}
+
+func setAdminAPIRuntimeControllers(service *Service, quotaService *trafficquota.Service, speedService *speedlimiter.Service) {
+	setter := reflect.ValueOf(service).MethodByName("SetRuntimeControllers")
+	if !setter.IsValid() {
+		return
+	}
+	setter.Call([]reflect.Value{
+		reflect.ValueOf(quotaService),
+		reflect.ValueOf(speedService),
+	})
 }
 
 func loginAdminAPIUserTestToken(t *testing.T, service *Service) string {
