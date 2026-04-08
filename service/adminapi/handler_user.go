@@ -40,15 +40,6 @@ type deleteUserRequest struct {
 	User string `json:"user"`
 }
 
-type deleteRuntimeState struct {
-	quota         option.TrafficQuotaUser
-	hasQuota      bool
-	speed         option.SpeedLimiterUser
-	hasSpeed      bool
-	speedSchedule []speedlimiter.UserSchedule
-	hasSchedule   bool
-}
-
 func (r deleteUserRequest) userName() string {
 	if r.User != "" {
 		return r.User
@@ -208,93 +199,32 @@ func (s *Service) DeleteUserHandler(writer http.ResponseWriter, request *http.Re
 		return
 	}
 	name := userRequest.userName()
-	state := s.snapshotDeleteRuntimeState(name)
 	if err := s.cleanupDeleteRuntimeState(name); err != nil {
 		writeRuntimeControlError(writer, err)
 		return
 	}
 	if err := s.userProvider.DeleteUser(name); err != nil {
-		restoreErr := s.restoreDeleteRuntimeState(name, state)
-		if restoreErr != nil {
-			err = E.Errors(err, E.Cause(restoreErr, "restore runtime state after delete failure"))
-		}
 		writeUserProviderError(writer, err)
 		return
 	}
 	writer.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Service) snapshotDeleteRuntimeState(name string) deleteRuntimeState {
-	var state deleteRuntimeState
-	if s.quotaController != nil {
-		state.quota, state.hasQuota = s.quotaController.GetConfig(name)
-	}
-	if s.speedController != nil {
-		state.speed, state.hasSpeed = s.speedController.GetConfig(name)
-		state.speedSchedule, state.hasSchedule = s.speedController.GetUserSchedules(name)
-	}
-	return state
-}
-
 func (s *Service) cleanupDeleteRuntimeState(name string) error {
-	var rollback deleteRuntimeState
-	if s.speedController != nil {
-		schedules, ok := s.speedController.GetUserSchedules(name)
-		if ok {
-			rollback.speedSchedule = schedules
-			rollback.hasSchedule = true
+	if s.quotaController != nil {
+		if err := s.quotaController.RemoveConfig(name); err != nil {
+			return err
 		}
+	}
+	if s.speedController != nil {
 		if err := s.speedController.RemoveUserSchedules(name); err != nil {
 			return err
 		}
-		speedConfig, ok := s.speedController.GetConfig(name)
-		if ok {
-			rollback.speed = speedConfig
-			rollback.hasSpeed = true
-		}
 		if err := s.speedController.RemoveConfig(name); err != nil {
-			restoreErr := s.restoreDeleteRuntimeState(name, rollback)
-			if restoreErr != nil {
-				err = E.Errors(err, E.Cause(restoreErr, "restore delete runtime state"))
-			}
-			return err
-		}
-	}
-	if s.quotaController != nil {
-		quotaConfig, ok := s.quotaController.GetConfig(name)
-		if ok {
-			rollback.quota = quotaConfig
-			rollback.hasQuota = true
-		}
-		if err := s.quotaController.RemoveConfig(name); err != nil {
-			restoreErr := s.restoreDeleteRuntimeState(name, rollback)
-			if restoreErr != nil {
-				err = E.Errors(err, E.Cause(restoreErr, "restore delete runtime state"))
-			}
 			return err
 		}
 	}
 	return nil
-}
-
-func (s *Service) restoreDeleteRuntimeState(name string, state deleteRuntimeState) error {
-	var errs []error
-	if s.quotaController != nil && state.hasQuota {
-		if err := s.quotaController.ApplyConfig(state.quota); err != nil {
-			errs = append(errs, E.Cause(err, "restore quota config"))
-		}
-	}
-	if s.speedController != nil && state.hasSpeed {
-		if err := s.speedController.ApplyConfig(state.speed); err != nil {
-			errs = append(errs, E.Cause(err, "restore speed config"))
-		}
-	}
-	if s.speedController != nil && state.hasSchedule {
-		if err := s.speedController.ReplaceUserSchedules(name, state.speedSchedule); err != nil {
-			errs = append(errs, E.Cause(err, "restore speed schedules"))
-		}
-	}
-	return E.Errors(errs...)
 }
 
 func writeUserProviderError(writer http.ResponseWriter, err error) {

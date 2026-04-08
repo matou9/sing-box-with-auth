@@ -450,7 +450,7 @@ func TestAdminAPIUserCreateRollsBackOnScheduleFailure(t *testing.T) {
 func TestAdminAPIUserDeleteKeepsLifecycleWhenQuotaCleanupFails(t *testing.T) {
 	provider := &stubUserProvider{}
 	quotaService := newAdminAPIFailingRemoveQuotaService(t, errors.New("quota cleanup failed"))
-	speedService := newAdminAPIUserSpeedService(t)
+	speedService := newAdminAPICountingSpeedService(t)
 	service := newAdminAPIUserTestService(t, "", provider, quotaService, speedService)
 	token := loginAdminAPIUserTestToken(t, service)
 
@@ -471,6 +471,15 @@ func TestAdminAPIUserDeleteKeepsLifecycleWhenQuotaCleanupFails(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("prime speed service: %v", err)
 	}
+	if err := speedService.ReplaceUserSchedules("sekai", []speedlimiter.UserSchedule{
+		{
+			TimeRange:    "08:00-18:00",
+			UploadMbps:   2,
+			DownloadMbps: 4,
+		},
+	}); err != nil {
+		t.Fatalf("prime speed schedules: %v", err)
+	}
 
 	recorder := performAdminAPIRequest(service, http.MethodPost, service.basePath+"/user/delete", `{"user":"sekai","purge_limits":true}`, token)
 	if recorder.Code != http.StatusInternalServerError {
@@ -485,6 +494,15 @@ func TestAdminAPIUserDeleteKeepsLifecycleWhenQuotaCleanupFails(t *testing.T) {
 	}
 	if _, _, ok := speedService.CurrentSpeed("sekai"); !ok {
 		t.Fatal("expected speed state to remain for sekai")
+	}
+	if _, ok := speedService.GetUserSchedules("sekai"); !ok {
+		t.Fatal("expected schedule state to remain for sekai")
+	}
+	if speedService.removeConfigCalls != 0 {
+		t.Fatalf("expected no speed config cleanup on quota failure, got %d", speedService.removeConfigCalls)
+	}
+	if speedService.removeScheduleCalls != 0 {
+		t.Fatalf("expected no schedule cleanup on quota failure, got %d", speedService.removeScheduleCalls)
 	}
 }
 
@@ -590,6 +608,28 @@ func newAdminAPIUserSpeedService(t *testing.T) *speedlimiter.Service {
 		t.Fatalf("unexpected speed service type: %T", rawService)
 	}
 	return service
+}
+
+type countingSpeedService struct {
+	*speedlimiter.Service
+	removeConfigCalls   int
+	removeScheduleCalls int
+}
+
+func newAdminAPICountingSpeedService(t *testing.T) *countingSpeedService {
+	t.Helper()
+
+	return &countingSpeedService{Service: newAdminAPIUserSpeedService(t)}
+}
+
+func (s *countingSpeedService) RemoveConfig(user string) error {
+	s.removeConfigCalls++
+	return s.Service.RemoveConfig(user)
+}
+
+func (s *countingSpeedService) RemoveUserSchedules(user string) error {
+	s.removeScheduleCalls++
+	return s.Service.RemoveUserSchedules(user)
 }
 
 type failingScheduleSpeedService struct {
