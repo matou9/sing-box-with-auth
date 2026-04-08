@@ -173,6 +173,52 @@ func TestServiceRestoreStateDoesNotDoubleCountPendingDeltaAfterFlush(t *testing.
 	}
 }
 
+func TestServiceRestoreStateDoesNotRaceFlushPendingIntoDoubleCount(t *testing.T) {
+	service := newTestService(t, option.TrafficQuotaServiceOptions{
+		Users: []option.TrafficQuotaUser{
+			{Name: "alice", QuotaGB: quotaGB(2048), Period: "daily"},
+		},
+	})
+	service.manager.now = func() time.Time {
+		return time.Date(2026, 4, 7, 10, 0, 0, 0, time.UTC)
+	}
+	flushDone := make(chan error, 1)
+	stub := newBlockingSavePersister(func() {
+		go func() {
+			flushDone <- service.flushPending()
+		}()
+	})
+	service.persister = stub
+
+	restoreDone := make(chan error, 1)
+	go func() {
+		restoreDone <- service.RestoreState(RuntimeState{
+			User: option.TrafficQuotaUser{
+				Name:    "alice",
+				QuotaGB: quotaGB(2048),
+				Period:  "daily",
+			},
+			UsageBytes:   500,
+			PendingDelta: 200,
+			Exceeded:     false,
+			PeriodKey:    "2026-04-07",
+		})
+	}()
+
+	<-stub.saveStarted
+	close(stub.releaseSave)
+
+	if err := <-restoreDone; err != nil {
+		t.Fatalf("restore state: %v", err)
+	}
+	if err := <-flushDone; err != nil {
+		t.Fatalf("flush pending after restore: %v", err)
+	}
+	if value := stub.store["2026-04-07"]["alice"]; value != 500 {
+		t.Fatalf("persisted value after interleaved flush = %d, want 500", value)
+	}
+}
+
 func newTestService(t *testing.T, options option.TrafficQuotaServiceOptions) *Service {
 	t.Helper()
 
@@ -194,9 +240,25 @@ type stubPersister struct {
 	deleteCalls []string
 }
 
+type blockingSavePersister struct {
+	*stubPersister
+	saveStarted chan struct{}
+	releaseSave chan struct{}
+	onSave      func()
+}
+
 func newStubPersister() *stubPersister {
 	return &stubPersister{
 		store: make(map[string]map[string]int64),
+	}
+}
+
+func newBlockingSavePersister(onSave func()) *blockingSavePersister {
+	return &blockingSavePersister{
+		stubPersister: newStubPersister(),
+		saveStarted:   make(chan struct{}),
+		releaseSave:   make(chan struct{}),
+		onSave:        onSave,
 	}
 }
 
@@ -223,6 +285,18 @@ func (p *stubPersister) Save(user, periodKey string, bytes int64) error {
 		p.store[periodKey] = make(map[string]int64)
 	}
 	p.store[periodKey][user] = bytes
+	return nil
+}
+
+func (p *blockingSavePersister) Save(user, periodKey string, bytes int64) error {
+	if err := p.stubPersister.Save(user, periodKey, bytes); err != nil {
+		return err
+	}
+	close(p.saveStarted)
+	if p.onSave != nil {
+		p.onSave()
+	}
+	<-p.releaseSave
 	return nil
 }
 

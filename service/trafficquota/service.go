@@ -3,6 +3,7 @@ package trafficquota
 import (
 	"context"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -41,6 +42,7 @@ type Service struct {
 	manager       *QuotaManager
 	persistence   *option.TrafficQuotaPersistence
 	persister     Persister
+	persistAccess sync.Mutex
 	flushInterval time.Duration
 }
 
@@ -88,6 +90,8 @@ func (s *Service) ApplyConfig(user option.TrafficQuotaUser) error {
 }
 
 func (s *Service) RemoveConfig(user string) error {
+	s.persistAccess.Lock()
+	defer s.persistAccess.Unlock()
 	if s.persister != nil && s.manager.HasQuota(user) {
 		if err := s.persister.Delete(user, s.manager.CurrentPeriodKey(user)); err != nil {
 			return err
@@ -105,6 +109,8 @@ func (s *Service) SnapshotState(user string) (RuntimeState, bool) {
 }
 
 func (s *Service) RestoreState(state RuntimeState) error {
+	s.persistAccess.Lock()
+	defer s.persistAccess.Unlock()
 	if err := s.manager.RestoreState(state); err != nil {
 		return err
 	}
@@ -249,6 +255,8 @@ func (s *Service) runPeriodResetLoop() {
 }
 
 func (s *Service) flushPending() error {
+	s.persistAccess.Lock()
+	defer s.persistAccess.Unlock()
 	if s.persister == nil {
 		return nil
 	}
@@ -283,6 +291,8 @@ func (s *Service) flushPending() error {
 }
 
 func (s *Service) handlePeriodResets(now time.Time) error {
+	s.persistAccess.Lock()
+	defer s.persistAccess.Unlock()
 	if s.persister == nil {
 		return nil
 	}
