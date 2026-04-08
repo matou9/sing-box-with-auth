@@ -101,6 +101,18 @@ func (c *ThrottledPacketConn) WritePacket(buffer *buf.Buffer, destination M.Sock
 	return c.PacketConn.WritePacket(buffer, destination)
 }
 
+// FrontHeadroom and RearHeadroom forward the underlying conn's headroom requirements
+// so bufio.CopyPacketWithPool allocates buffers with sufficient header space.
+// We must NOT implement Upstream() — that would let sing's bufio unwrap this conn
+// and bypass throttling — so we forward headroom explicitly instead.
+func (c *ThrottledPacketConn) FrontHeadroom() int {
+	return N.CalculateFrontHeadroom(c.PacketConn)
+}
+
+func (c *ThrottledPacketConn) RearHeadroom() int {
+	return N.CalculateRearHeadroom(c.PacketConn)
+}
+
 // NOTE: Do NOT implement Upstream() — sing's bufio would unwrap this conn
 // and bypass the throttled ReadPacket/WritePacket.
 

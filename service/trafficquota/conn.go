@@ -114,3 +114,15 @@ func (c *QuotaPacketConn) Close() error {
 func (c *QuotaPacketConn) markQuotaExceeded() {
 	c.closed.Store(true)
 }
+
+// FrontHeadroom and RearHeadroom forward the underlying conn's headroom requirements
+// so bufio.CopyPacketWithPool allocates buffers with sufficient header space.
+// QuotaPacketConn must NOT implement Upstream() — that would let sing's bufio unwrap
+// this conn and bypass quota tracking — so we forward headroom explicitly instead.
+func (c *QuotaPacketConn) FrontHeadroom() int {
+	return N.CalculateFrontHeadroom(c.PacketConn)
+}
+
+func (c *QuotaPacketConn) RearHeadroom() int {
+	return N.CalculateRearHeadroom(c.PacketConn)
+}
