@@ -1,10 +1,11 @@
 package option
 
 type SpeedLimiterServiceOptions struct {
-	Default   *SpeedLimiterDefault    `json:"default,omitempty"`
-	Groups    []SpeedLimiterGroup     `json:"groups,omitempty"`
-	Users     []SpeedLimiterUser      `json:"users,omitempty"`
-	Schedules []SpeedLimiterSchedule  `json:"schedules,omitempty"`
+	Default   *SpeedLimiterDefault  `json:"default,omitempty"`
+	Groups    []SpeedLimiterGroup   `json:"groups,omitempty"`
+	Users     []SpeedLimiterUser    `json:"users,omitempty"`
+	Schedules []SpeedLimiterSchedule `json:"schedules,omitempty"`
+	Dynamic   *DynamicConfigOptions `json:"dynamic,omitempty"`
 }
 
 type SpeedLimiterDefault struct {

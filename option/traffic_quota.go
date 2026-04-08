@@ -7,6 +7,7 @@ type TrafficQuotaServiceOptions struct {
 	Users         []TrafficQuotaUser       `json:"users,omitempty"`
 	Persistence   *TrafficQuotaPersistence `json:"persistence,omitempty"`
 	FlushInterval badoption.Duration       `json:"flush_interval,omitempty"`
+	Dynamic       *DynamicConfigOptions    `json:"dynamic,omitempty"`
 }
 
 type TrafficQuotaGroup struct {

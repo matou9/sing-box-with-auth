@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -160,7 +161,12 @@ func (a *Authenticator) validateAuthorization(request *http.Request) (AuthSubjec
 
 func (a *Authenticator) validateBasicCredentials(username string, password string) (AuthSubject, error) {
 	expectedPassword, ok := a.admins[username]
-	if !ok || expectedPassword != password {
+	if !ok {
+		// Still run comparison to prevent username enumeration via timing
+		subtle.ConstantTimeCompare([]byte(password), []byte(password))
+		return AuthSubject{}, errUnauthorized
+	}
+	if subtle.ConstantTimeCompare([]byte(expectedPassword), []byte(password)) != 1 {
 		return AuthSubject{}, errUnauthorized
 	}
 	return AuthSubject{Username: username}, nil

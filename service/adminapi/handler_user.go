@@ -61,10 +61,7 @@ func (r deleteUserRequest) userName() string {
 }
 
 func (s *Service) ListUsersHandler(writer http.ResponseWriter, _ *http.Request) {
-	if err := s.ensureManagedServices(); err != nil {
-		writer.WriteHeader(http.StatusServiceUnavailable)
-		return
-	}
+	s.ensureManagedServices()
 	if s.userProvider == nil {
 		writer.WriteHeader(http.StatusServiceUnavailable)
 		return
@@ -76,10 +73,7 @@ func (s *Service) ListUsersHandler(writer http.ResponseWriter, _ *http.Request) 
 }
 
 func (s *Service) GetUserHandler(writer http.ResponseWriter, request *http.Request) {
-	if err := s.ensureManagedServices(); err != nil {
-		writer.WriteHeader(http.StatusServiceUnavailable)
-		return
-	}
+	s.ensureManagedServices()
 	if s.userProvider == nil {
 		writer.WriteHeader(http.StatusServiceUnavailable)
 		return
@@ -101,10 +95,7 @@ func (s *Service) GetUserHandler(writer http.ResponseWriter, request *http.Reque
 }
 
 func (s *Service) CreateUserHandler(writer http.ResponseWriter, request *http.Request) {
-	if err := s.ensureManagedServices(); err != nil {
-		writer.WriteHeader(http.StatusServiceUnavailable)
-		return
-	}
+	s.ensureManagedServices()
 	if s.userProvider == nil {
 		writer.WriteHeader(http.StatusServiceUnavailable)
 		return
@@ -187,10 +178,7 @@ func (s *Service) rollbackCreatedUser(name string, quotaApplied bool, speedAppli
 }
 
 func (s *Service) UpdateUserHandler(writer http.ResponseWriter, request *http.Request) {
-	if err := s.ensureManagedServices(); err != nil {
-		writer.WriteHeader(http.StatusServiceUnavailable)
-		return
-	}
+	s.ensureManagedServices()
 	if s.userProvider == nil {
 		writer.WriteHeader(http.StatusServiceUnavailable)
 		return
@@ -213,10 +201,7 @@ func (s *Service) UpdateUserHandler(writer http.ResponseWriter, request *http.Re
 }
 
 func (s *Service) DeleteUserHandler(writer http.ResponseWriter, request *http.Request) {
-	if err := s.ensureManagedServices(); err != nil {
-		writer.WriteHeader(http.StatusServiceUnavailable)
-		return
-	}
+	s.ensureManagedServices()
 	if s.userProvider == nil {
 		writer.WriteHeader(http.StatusServiceUnavailable)
 		return

@@ -213,6 +213,9 @@ func (m *QuotaManager) RemoveConfig(user string) error {
 		return E.New("traffic-quota user missing name")
 	}
 	m.deleteConfig(user)
+	if cl, ok := m.activeConns.Load(user); ok {
+		cl.closeAll()
+	}
 	m.activeConns.Delete(user)
 	m.states.Delete(user)
 	return nil
@@ -358,10 +361,10 @@ func (m *QuotaManager) CheckPeriodReset(now time.Time) []PeriodReset {
 		if currentKey == previousKey {
 			continue
 		}
-		state.setPeriodKey(currentKey)
+		state.pendingDelta.Swap(0)
 		state.usage.Store(0)
-		state.pendingDelta.Store(0)
 		state.exceeded.Store(false)
+		state.setPeriodKey(currentKey)
 		resets = append(resets, PeriodReset{
 			User:          user,
 			PreviousKey:   previousKey,

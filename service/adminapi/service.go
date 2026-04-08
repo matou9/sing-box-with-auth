@@ -2,10 +2,12 @@ package adminapi
 
 import (
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"path"
 	"strings"
-	"sync"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	boxService "github.com/sagernet/sing-box/adapter/service"
@@ -14,6 +16,7 @@ import (
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/service/speedlimiter"
 	"github.com/sagernet/sing-box/service/trafficquota"
+	E "github.com/sagernet/sing/common/exceptions"
 	singservice "github.com/sagernet/sing/service"
 
 	"github.com/go-chi/chi/v5"
@@ -56,13 +59,13 @@ type Service struct {
 	ctx             context.Context
 	logger          log.ContextLogger
 	serviceManager  adapter.ServiceManager
-	resolveOnce     sync.Once
-	resolveErr      error
 	authenticator   *Authenticator
 	userProvider    UserProvider
 	quotaController QuotaController
 	speedController SpeedController
 	basePath        string
+	listenAddr      string
+	httpServer      *http.Server
 	router          http.Handler
 }
 
@@ -78,6 +81,7 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 		serviceManager: singservice.FromContext[adapter.ServiceManager](ctx),
 		authenticator:  authenticator,
 		basePath:       normalizeBasePath(options.Path),
+		listenAddr:     options.Listen,
 	}
 	router := chi.NewRouter()
 	router.Route(svc.basePath, func(baseRouter chi.Router) {
@@ -87,19 +91,53 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 		baseRouter.Handle("/user/create", svc.authenticatedPost(http.HandlerFunc(svc.CreateUserHandler)))
 		baseRouter.Handle("/user/update", svc.authenticatedPost(http.HandlerFunc(svc.UpdateUserHandler)))
 		baseRouter.Handle("/user/delete", svc.authenticatedPost(http.HandlerFunc(svc.DeleteUserHandler)))
+		baseRouter.Route("/quota", func(r chi.Router) {
+			r.Use(authenticator.Middleware)
+			r.Get("/{user}", http.HandlerFunc(svc.GetQuotaStatusHandler))
+			r.Put("/{user}", http.HandlerFunc(svc.PutQuotaHandler))
+			r.Delete("/{user}", http.HandlerFunc(svc.DeleteQuotaHandler))
+		})
+		baseRouter.Route("/speed", func(r chi.Router) {
+			r.Use(authenticator.Middleware)
+			r.Get("/{user}", http.HandlerFunc(svc.GetSpeedHandler))
+			r.Put("/{user}", http.HandlerFunc(svc.PutSpeedHandler))
+			r.Delete("/{user}", http.HandlerFunc(svc.DeleteSpeedHandler))
+			r.Get("/{user}/schedules", http.HandlerFunc(svc.GetSpeedSchedulesHandler))
+			r.Put("/{user}/schedules", http.HandlerFunc(svc.PutSpeedSchedulesHandler))
+			r.Delete("/{user}/schedules", http.HandlerFunc(svc.DeleteSpeedSchedulesHandler))
+		})
 	})
 	svc.router = router
 	return svc, nil
 }
 
 func (s *Service) Start(stage adapter.StartStage) error {
-	if stage == adapter.StartStateInitialize {
-		return s.ensureManagedServices()
+	if stage != adapter.StartStateStart {
+		return nil
+	}
+	s.userProvider, s.quotaController, s.speedController = s.resolveManagedServices()
+	if s.listenAddr != "" {
+		ln, err := net.Listen("tcp", s.listenAddr)
+		if err != nil {
+			return E.Cause(err, "admin-api listen")
+		}
+		s.httpServer = &http.Server{Handler: s.router}
+		s.logger.Info("admin-api listening on ", s.listenAddr)
+		go func() {
+			if err := s.httpServer.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				s.logger.Error("admin-api serve: ", err)
+			}
+		}()
 	}
 	return nil
 }
 
 func (s *Service) Close() error {
+	if s.httpServer != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return s.httpServer.Shutdown(shutdownCtx)
+	}
 	return nil
 }
 
@@ -107,16 +145,14 @@ func (s *Service) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	s.router.ServeHTTP(writer, request)
 }
 
-func (s *Service) ensureManagedServices() error {
-	s.resolveOnce.Do(func() {
-		s.userProvider, s.quotaController, s.speedController, s.resolveErr = s.resolveManagedServices()
-	})
-	return s.resolveErr
-}
+// ensureManagedServices is a no-op kept for call-site compatibility.
+// Fields are set once in Start(StartStateStart) before the HTTP server
+// begins accepting connections, so handlers only read them — no lock needed.
+func (s *Service) ensureManagedServices() {}
 
-func (s *Service) resolveManagedServices() (UserProvider, QuotaController, SpeedController, error) {
+func (s *Service) resolveManagedServices() (UserProvider, QuotaController, SpeedController) {
 	if s.serviceManager == nil {
-		return nil, nil, nil, nil
+		return nil, nil, nil
 	}
 	var userProvider UserProvider
 	var quotaController QuotaController
@@ -141,7 +177,7 @@ func (s *Service) resolveManagedServices() (UserProvider, QuotaController, Speed
 			}
 		}
 	}
-	return userProvider, quotaController, speedController, nil
+	return userProvider, quotaController, speedController
 }
 
 func normalizeBasePath(rawPath string) string {
