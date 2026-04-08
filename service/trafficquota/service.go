@@ -100,6 +100,26 @@ func (s *Service) GetConfig(user string) (option.TrafficQuotaUser, bool) {
 	return s.manager.GetConfig(user)
 }
 
+func (s *Service) SnapshotState(user string) (RuntimeState, bool) {
+	return s.manager.SnapshotState(user)
+}
+
+func (s *Service) RestoreState(state RuntimeState) error {
+	if err := s.manager.RestoreState(state); err != nil {
+		return err
+	}
+	if s.persister != nil {
+		periodKey := state.PeriodKey
+		if periodKey == "" {
+			periodKey = s.manager.CurrentPeriodKey(state.User.Name)
+		}
+		if err := s.persister.Save(state.User.Name, periodKey, state.UsageBytes); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Service) QuotaStatus(user string) (Status, bool) {
 	return s.manager.Status(user)
 }

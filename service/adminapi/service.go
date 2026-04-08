@@ -36,6 +36,8 @@ type QuotaController interface {
 	ApplyConfig(user option.TrafficQuotaUser) error
 	RemoveConfig(user string) error
 	GetConfig(user string) (option.TrafficQuotaUser, bool)
+	SnapshotState(user string) (trafficquota.RuntimeState, bool)
+	RestoreState(state trafficquota.RuntimeState) error
 	QuotaStatus(user string) (trafficquota.Status, bool)
 }
 

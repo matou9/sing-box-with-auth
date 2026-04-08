@@ -28,6 +28,15 @@ type QuotaConfig struct {
 	periodDays  int
 }
 
+type RuntimeState struct {
+	User         option.TrafficQuotaUser
+	UsageBytes   int64
+	PendingDelta int64
+	Exceeded     bool
+	PeriodKey    string
+	activeConns  *connList
+}
+
 type quotaTrackedConn interface {
 	markQuotaExceeded()
 }
@@ -110,10 +119,11 @@ func (s *userState) setPeriodKeyIfEmpty(periodKey string) {
 }
 
 type QuotaManager struct {
-	userConfigs map[string]*QuotaConfig
-	activeConns compatible.Map[string, *connList]
-	states      compatible.Map[string, *userState]
-	now         func() time.Time
+	userConfigAccess sync.RWMutex
+	userConfigs      map[string]*QuotaConfig
+	activeConns      compatible.Map[string, *connList]
+	states           compatible.Map[string, *userState]
+	now              func() time.Time
 }
 
 func NewQuotaManager(options option.TrafficQuotaServiceOptions) (*QuotaManager, error) {
@@ -159,7 +169,7 @@ func NewQuotaManager(options option.TrafficQuotaServiceOptions) (*QuotaManager, 
 }
 
 func (m *QuotaManager) RegisterConn(user string, conn quotaTrackedConn) (func(int), func()) {
-	if _, loaded := m.userConfigs[user]; !loaded {
+	if _, loaded := m.loadConfig(user); !loaded {
 		return nil, nil
 	}
 	state := m.stateFor(user)
@@ -187,7 +197,7 @@ func (m *QuotaManager) ApplyConfig(user option.TrafficQuotaUser) error {
 	if config == nil {
 		return E.New("invalid traffic-quota user ", user.Name)
 	}
-	m.userConfigs[user.Name] = config
+	m.storeConfig(user.Name, config)
 	state := m.stateFor(user.Name)
 	state.setPeriodKeyIfEmpty(m.mustPeriodKey(user.Name, m.now()))
 	if state.usage.Load() > config.quotaBytes {
@@ -202,14 +212,14 @@ func (m *QuotaManager) RemoveConfig(user string) error {
 	if user == "" {
 		return E.New("traffic-quota user missing name")
 	}
-	delete(m.userConfigs, user)
+	m.deleteConfig(user)
 	m.activeConns.Delete(user)
 	m.states.Delete(user)
 	return nil
 }
 
 func (m *QuotaManager) Status(user string) (Status, bool) {
-	config, loaded := m.userConfigs[user]
+	config, loaded := m.loadConfig(user)
 	if !loaded {
 		return Status{}, false
 	}
@@ -225,21 +235,57 @@ func (m *QuotaManager) Status(user string) (Status, bool) {
 }
 
 func (m *QuotaManager) GetConfig(user string) (option.TrafficQuotaUser, bool) {
-	config, loaded := m.userConfigs[user]
+	config, loaded := m.loadConfig(user)
 	if !loaded {
 		return option.TrafficQuotaUser{}, false
 	}
-	return option.TrafficQuotaUser{
-		Name:        user,
-		QuotaGB:     float64(config.quotaBytes) / float64(1<<30),
-		Period:      string(config.period),
-		PeriodStart: formatPeriodStart(config.periodStart),
-		PeriodDays:  config.periodDays,
-	}, true
+	return quotaConfigToOption(user, config), true
+}
+
+func (m *QuotaManager) SnapshotState(user string) (RuntimeState, bool) {
+	config, loaded := m.loadConfig(user)
+	if !loaded {
+		return RuntimeState{}, false
+	}
+	snapshot := RuntimeState{
+		User: quotaConfigToOption(user, config),
+	}
+	if state, loaded := m.states.Load(user); loaded {
+		snapshot.UsageBytes = state.usage.Load()
+		snapshot.PendingDelta = state.pendingDelta.Load()
+		snapshot.Exceeded = state.exceeded.Load()
+		snapshot.PeriodKey = state.getPeriodKey()
+	}
+	if activeConns, loaded := m.activeConns.Load(user); loaded {
+		snapshot.activeConns = activeConns
+	}
+	return snapshot, true
+}
+
+func (m *QuotaManager) RestoreState(state RuntimeState) error {
+	config, err := newQuotaConfig(state.User.QuotaGB, state.User.Period, state.User.PeriodStart, state.User.PeriodDays, nil)
+	if err != nil {
+		return E.Cause(err, "invalid traffic-quota user ", state.User.Name)
+	}
+	if config == nil {
+		return E.New("invalid traffic-quota user ", state.User.Name)
+	}
+	m.storeConfig(state.User.Name, config)
+	userState := m.stateFor(state.User.Name)
+	userState.usage.Store(state.UsageBytes)
+	userState.pendingDelta.Store(state.PendingDelta)
+	userState.exceeded.Store(state.Exceeded)
+	userState.setPeriodKey(state.PeriodKey)
+	if state.activeConns != nil {
+		m.activeConns.Store(state.User.Name, state.activeConns)
+	} else {
+		m.activeConns.Delete(state.User.Name)
+	}
+	return nil
 }
 
 func (m *QuotaManager) HasQuota(user string) bool {
-	_, loaded := m.userConfigs[user]
+	_, loaded := m.loadConfig(user)
 	return loaded
 }
 
@@ -247,7 +293,7 @@ func (m *QuotaManager) AddBytes(user string, n int) {
 	if n <= 0 {
 		return
 	}
-	config, loaded := m.userConfigs[user]
+	config, loaded := m.loadConfig(user)
 	if !loaded {
 		return
 	}
@@ -261,7 +307,7 @@ func (m *QuotaManager) AddBytes(user string, n int) {
 }
 
 func (m *QuotaManager) LoadUsage(user string, bytes int64) {
-	config, loaded := m.userConfigs[user]
+	config, loaded := m.loadConfig(user)
 	if !loaded {
 		return
 	}
@@ -290,7 +336,7 @@ func (m *QuotaManager) IsExceeded(user string) bool {
 
 func (m *QuotaManager) CheckPeriodReset(now time.Time) []PeriodReset {
 	var resets []PeriodReset
-	for user := range m.userConfigs {
+	for _, user := range m.userNames() {
 		state, loaded := m.states.Load(user)
 		if !loaded {
 			continue
@@ -318,7 +364,7 @@ func (m *QuotaManager) CheckPeriodReset(now time.Time) []PeriodReset {
 }
 
 func (m *QuotaManager) GetCurrentPeriodKey(user string, now time.Time) (string, error) {
-	config, loaded := m.userConfigs[user]
+	config, loaded := m.loadConfig(user)
 	if !loaded {
 		return "", E.New("traffic-quota user not configured: ", user)
 	}
@@ -338,15 +384,12 @@ func (m *QuotaManager) CurrentPeriodKey(user string) string {
 
 func (m *QuotaManager) Users() []string {
 	users := make([]string, 0, len(m.userConfigs))
-	for user := range m.userConfigs {
-		users = append(users, user)
-	}
-	return users
+	return append(users, m.userNames()...)
 }
 
 func (m *QuotaManager) ConsumePendingDeltas() map[string]int64 {
 	pending := make(map[string]int64)
-	for user := range m.userConfigs {
+	for _, user := range m.userNames() {
 		state, loaded := m.states.Load(user)
 		if !loaded {
 			continue
@@ -370,6 +413,35 @@ func (m *QuotaManager) RestorePendingDelta(user string, delta int64) {
 func (m *QuotaManager) stateFor(user string) *userState {
 	state, _ := m.states.LoadOrStore(user, &userState{})
 	return state
+}
+
+func (m *QuotaManager) loadConfig(user string) (*QuotaConfig, bool) {
+	m.userConfigAccess.RLock()
+	config, loaded := m.userConfigs[user]
+	m.userConfigAccess.RUnlock()
+	return config, loaded
+}
+
+func (m *QuotaManager) storeConfig(user string, config *QuotaConfig) {
+	m.userConfigAccess.Lock()
+	m.userConfigs[user] = config
+	m.userConfigAccess.Unlock()
+}
+
+func (m *QuotaManager) deleteConfig(user string) {
+	m.userConfigAccess.Lock()
+	delete(m.userConfigs, user)
+	m.userConfigAccess.Unlock()
+}
+
+func (m *QuotaManager) userNames() []string {
+	m.userConfigAccess.RLock()
+	users := make([]string, 0, len(m.userConfigs))
+	for user := range m.userConfigs {
+		users = append(users, user)
+	}
+	m.userConfigAccess.RUnlock()
+	return users
 }
 
 func (m *QuotaManager) tripExceeded(user string, state *userState) {
@@ -500,4 +572,14 @@ func formatPeriodStart(value time.Time) string {
 		return ""
 	}
 	return value.UTC().Format(time.RFC3339)
+}
+
+func quotaConfigToOption(user string, config *QuotaConfig) option.TrafficQuotaUser {
+	return option.TrafficQuotaUser{
+		Name:        user,
+		QuotaGB:     float64(config.quotaBytes) / float64(1<<30),
+		Period:      string(config.period),
+		PeriodStart: formatPeriodStart(config.periodStart),
+		PeriodDays:  config.periodDays,
+	}
 }

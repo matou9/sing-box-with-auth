@@ -68,6 +68,16 @@ func (s *stubUserProvider) CreateUser(user option.User) error {
 		return s.createErr
 	}
 	s.created = append(s.created, user)
+	if s.users == nil {
+		s.users = make(map[string]adapter.User)
+	}
+	s.users[user.Name] = adapter.User{
+		Name:     user.Name,
+		Password: user.Password,
+		UUID:     user.UUID,
+		AlterId:  user.AlterId,
+		Flow:     user.Flow,
+	}
 	return nil
 }
 
@@ -84,6 +94,7 @@ func (s *stubUserProvider) DeleteUser(name string) error {
 		return s.deleteErr
 	}
 	s.deleted = append(s.deleted, name)
+	delete(s.users, name)
 	return nil
 }
 
@@ -486,8 +497,11 @@ func TestAdminAPIUserDeleteKeepsLifecycleWhenQuotaCleanupFails(t *testing.T) {
 		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
 	}
 
-	if len(provider.deleted) != 0 {
-		t.Fatalf("expected user delete to be skipped on cleanup failure, got %#v", provider.deleted)
+	if len(provider.deleted) != 1 || provider.deleted[0] != "sekai" {
+		t.Fatalf("expected user delete before compensation, got %#v", provider.deleted)
+	}
+	if _, ok := provider.GetUser("sekai"); !ok {
+		t.Fatal("expected user to be restored after cleanup failure")
 	}
 	if _, ok := quotaService.QuotaStatus("sekai"); !ok {
 		t.Fatal("expected quota state to remain for sekai")
@@ -498,11 +512,11 @@ func TestAdminAPIUserDeleteKeepsLifecycleWhenQuotaCleanupFails(t *testing.T) {
 	if _, ok := speedService.GetUserSchedules("sekai"); !ok {
 		t.Fatal("expected schedule state to remain for sekai")
 	}
-	if speedService.removeConfigCalls != 0 {
-		t.Fatalf("expected no speed config cleanup on quota failure, got %d", speedService.removeConfigCalls)
+	if speedService.removeConfigCalls == 0 {
+		t.Fatal("expected speed cleanup attempt before quota failure")
 	}
-	if speedService.removeScheduleCalls != 0 {
-		t.Fatalf("expected no schedule cleanup on quota failure, got %d", speedService.removeScheduleCalls)
+	if speedService.removeScheduleCalls == 0 {
+		t.Fatal("expected schedule cleanup attempt before quota failure")
 	}
 }
 
@@ -529,17 +543,23 @@ func TestAdminAPIUserProviderErrorMapping(t *testing.T) {
 			wantStatus: http.StatusNotFound,
 		},
 		{
-			name:       "delete internal",
-			path:       "/user/delete",
-			body:       `{"name":"sekai"}`,
-			provider:   &stubUserProvider{deleteErr: errors.New("write failed")},
+			name: "delete internal",
+			path: "/user/delete",
+			body: `{"name":"sekai"}`,
+			provider: &stubUserProvider{
+				users:     map[string]adapter.User{"sekai": {Name: "sekai"}},
+				deleteErr: errors.New("write failed"),
+			},
 			wantStatus: http.StatusInternalServerError,
 		},
 		{
-			name:       "delete unavailable",
-			path:       "/user/delete",
-			body:       `{"name":"sekai"}`,
-			provider:   &stubUserProvider{deleteErr: context.Canceled},
+			name: "delete unavailable",
+			path: "/user/delete",
+			body: `{"name":"sekai"}`,
+			provider: &stubUserProvider{
+				users:     map[string]adapter.User{"sekai": {Name: "sekai"}},
+				deleteErr: context.Canceled,
+			},
 			wantStatus: http.StatusServiceUnavailable,
 		},
 	}

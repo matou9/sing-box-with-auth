@@ -10,6 +10,7 @@ import (
 
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/service/speedlimiter"
+	"github.com/sagernet/sing-box/service/trafficquota"
 	userproviderservice "github.com/sagernet/sing-box/service/userprovider"
 	E "github.com/sagernet/sing/common/exceptions"
 )
@@ -38,6 +39,17 @@ type updateUserRequest struct {
 type deleteUserRequest struct {
 	Name string `json:"name"`
 	User string `json:"user"`
+}
+
+type deleteRuntimeState struct {
+	user         option.User
+	hasUser      bool
+	quota        trafficquota.RuntimeState
+	hasQuota     bool
+	speed        option.SpeedLimiterUser
+	hasSpeed     bool
+	schedules    []speedlimiter.UserSchedule
+	hasSchedules bool
 }
 
 func (r deleteUserRequest) userName() string {
@@ -199,23 +211,49 @@ func (s *Service) DeleteUserHandler(writer http.ResponseWriter, request *http.Re
 		return
 	}
 	name := userRequest.userName()
-	if err := s.cleanupDeleteRuntimeState(name); err != nil {
-		writeRuntimeControlError(writer, err)
+	state := s.snapshotDeleteRuntimeState(name)
+	if !state.hasUser {
+		writer.WriteHeader(http.StatusNotFound)
 		return
 	}
 	if err := s.userProvider.DeleteUser(name); err != nil {
 		writeUserProviderError(writer, err)
 		return
 	}
+	if err := s.cleanupDeleteRuntimeState(name); err != nil {
+		restoreErr := s.restoreDeleteRuntimeState(state)
+		if restoreErr != nil {
+			err = E.Errors(err, E.Cause(restoreErr, "restore delete runtime state"))
+		}
+		writeRuntimeControlError(writer, err)
+		return
+	}
 	writer.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Service) cleanupDeleteRuntimeState(name string) error {
-	if s.quotaController != nil {
-		if err := s.quotaController.RemoveConfig(name); err != nil {
-			return err
+func (s *Service) snapshotDeleteRuntimeState(name string) deleteRuntimeState {
+	var state deleteRuntimeState
+	if user, ok := s.userProvider.GetUser(name); ok {
+		state.user = option.User{
+			Name:     user.Name,
+			Password: user.Password,
+			UUID:     user.UUID,
+			AlterId:  user.AlterId,
+			Flow:     user.Flow,
 		}
+		state.hasUser = true
 	}
+	if s.quotaController != nil {
+		state.quota, state.hasQuota = s.quotaController.SnapshotState(name)
+	}
+	if s.speedController != nil {
+		state.speed, state.hasSpeed = s.speedController.GetConfig(name)
+		state.schedules, state.hasSchedules = s.speedController.GetUserSchedules(name)
+	}
+	return state
+}
+
+func (s *Service) cleanupDeleteRuntimeState(name string) error {
 	if s.speedController != nil {
 		if err := s.speedController.RemoveUserSchedules(name); err != nil {
 			return err
@@ -224,7 +262,37 @@ func (s *Service) cleanupDeleteRuntimeState(name string) error {
 			return err
 		}
 	}
+	if s.quotaController != nil {
+		if err := s.quotaController.RemoveConfig(name); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func (s *Service) restoreDeleteRuntimeState(state deleteRuntimeState) error {
+	var errs []error
+	if state.hasUser {
+		if err := s.userProvider.CreateUser(state.user); err != nil {
+			errs = append(errs, E.Cause(err, "restore deleted user"))
+		}
+	}
+	if s.quotaController != nil && state.hasQuota {
+		if err := s.quotaController.RestoreState(state.quota); err != nil {
+			errs = append(errs, E.Cause(err, "restore quota runtime state"))
+		}
+	}
+	if s.speedController != nil && state.hasSpeed {
+		if err := s.speedController.ApplyConfig(state.speed); err != nil {
+			errs = append(errs, E.Cause(err, "restore speed config"))
+		}
+	}
+	if s.speedController != nil && state.hasSchedules {
+		if err := s.speedController.ReplaceUserSchedules(state.user.Name, state.schedules); err != nil {
+			errs = append(errs, E.Cause(err, "restore speed schedules"))
+		}
+	}
+	return E.Errors(errs...)
 }
 
 func writeUserProviderError(writer http.ResponseWriter, err error) {
