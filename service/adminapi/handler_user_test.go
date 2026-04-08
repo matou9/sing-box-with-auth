@@ -599,6 +599,9 @@ func newAdminAPIUserTestService(t *testing.T, routePath string, managedServices 
 	service.authenticator.now = func() time.Time {
 		return time.Unix(1_700_000_000, 0)
 	}
+	if err := service.Start(adapter.StartStateStart); err != nil {
+		t.Fatalf("service.Start: %v", err)
+	}
 	return service
 }
 
