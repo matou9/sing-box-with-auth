@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
 	boxService "github.com/sagernet/sing-box/adapter/service"
@@ -55,6 +56,8 @@ type Service struct {
 	ctx             context.Context
 	logger          log.ContextLogger
 	serviceManager  adapter.ServiceManager
+	resolveOnce     sync.Once
+	resolveErr      error
 	authenticator   *Authenticator
 	userProvider    UserProvider
 	quotaController QuotaController
@@ -91,7 +94,7 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 
 func (s *Service) Start(stage adapter.StartStage) error {
 	if stage == adapter.StartStateInitialize {
-		s.resolveManagedServices()
+		return s.ensureManagedServices()
 	}
 	return nil
 }
@@ -104,9 +107,16 @@ func (s *Service) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	s.router.ServeHTTP(writer, request)
 }
 
-func (s *Service) resolveManagedServices() {
+func (s *Service) ensureManagedServices() error {
+	s.resolveOnce.Do(func() {
+		s.userProvider, s.quotaController, s.speedController, s.resolveErr = s.resolveManagedServices()
+	})
+	return s.resolveErr
+}
+
+func (s *Service) resolveManagedServices() (UserProvider, QuotaController, SpeedController, error) {
 	if s.serviceManager == nil {
-		return
+		return nil, nil, nil, nil
 	}
 	var userProvider UserProvider
 	var quotaController QuotaController
@@ -131,9 +141,7 @@ func (s *Service) resolveManagedServices() {
 			}
 		}
 	}
-	s.userProvider = userProvider
-	s.quotaController = quotaController
-	s.speedController = speedController
+	return userProvider, quotaController, speedController, nil
 }
 
 func normalizeBasePath(rawPath string) string {
