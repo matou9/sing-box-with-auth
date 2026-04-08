@@ -14,11 +14,18 @@ PREFIX ?= $(shell go env GOPATH)
 SING_FFI ?= sing-ffi
 LIBBOX_FFI_CONFIG ?= ./experimental/libbox/ffi.json
 
-.PHONY: test release docs build
+TAGS_WINDOWS = with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_redis,with_postgres
+PARAMS_WINDOWS = -trimpath -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=$(VERSION)' $(LDFLAGS_SHARED) -s -w -buildid=" -tags "$(TAGS_WINDOWS)"
+
+.PHONY: test release docs build build-windows
 
 build:
 	export GOTOOLCHAIN=local && \
 	go build $(MAIN_PARAMS) $(MAIN)
+
+build-windows:
+	export GOTOOLCHAIN=local && \
+	go build $(PARAMS_WINDOWS) -o sing-box.exe $(MAIN)
 
 race:
 	export GOTOOLCHAIN=local && \
