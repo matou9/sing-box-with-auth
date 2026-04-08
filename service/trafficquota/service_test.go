@@ -10,6 +10,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/service/dynamicconfig"
 )
 
 func TestServiceRoutedConnectionPassesThroughWithoutQuota(t *testing.T) {
@@ -135,6 +136,171 @@ func TestServiceInitPersisterFallsBackToNoopPersister(t *testing.T) {
 	}
 }
 
+func TestServiceRestoreStateDoesNotDoubleCountPendingDeltaAfterFlush(t *testing.T) {
+	service := newTestService(t, option.TrafficQuotaServiceOptions{
+		Users: []option.TrafficQuotaUser{
+			{Name: "alice", QuotaGB: quotaGB(2048), Period: "daily"},
+		},
+	})
+	service.manager.now = func() time.Time {
+		return time.Date(2026, 4, 7, 10, 0, 0, 0, time.UTC)
+	}
+	stub := newStubPersister()
+	service.persister = stub
+
+	err := service.RestoreState(RuntimeState{
+		User: option.TrafficQuotaUser{
+			Name:    "alice",
+			QuotaGB: quotaGB(2048),
+			Period:  "daily",
+		},
+		UsageBytes:   500,
+		PendingDelta: 200,
+		Exceeded:     false,
+		PeriodKey:    "2026-04-07",
+	})
+	if err != nil {
+		t.Fatalf("restore state: %v", err)
+	}
+	if value := stub.store["2026-04-07"]["alice"]; value != 500 {
+		t.Fatalf("persisted value after restore = %d, want 500", value)
+	}
+
+	if err := service.flushPending(); err != nil {
+		t.Fatalf("flush pending after restore: %v", err)
+	}
+	if value := stub.store["2026-04-07"]["alice"]; value != 500 {
+		t.Fatalf("persisted value after flush = %d, want 500", value)
+	}
+}
+
+func TestServiceRestoreStateDoesNotRaceFlushPendingIntoDoubleCount(t *testing.T) {
+	service := newTestService(t, option.TrafficQuotaServiceOptions{
+		Users: []option.TrafficQuotaUser{
+			{Name: "alice", QuotaGB: quotaGB(2048), Period: "daily"},
+		},
+	})
+	service.manager.now = func() time.Time {
+		return time.Date(2026, 4, 7, 10, 0, 0, 0, time.UTC)
+	}
+	flushDone := make(chan error, 1)
+	stub := newBlockingSavePersister(func() {
+		go func() {
+			flushDone <- service.flushPending()
+		}()
+	})
+	service.persister = stub
+
+	restoreDone := make(chan error, 1)
+	go func() {
+		restoreDone <- service.RestoreState(RuntimeState{
+			User: option.TrafficQuotaUser{
+				Name:    "alice",
+				QuotaGB: quotaGB(2048),
+				Period:  "daily",
+			},
+			UsageBytes:   500,
+			PendingDelta: 200,
+			Exceeded:     false,
+			PeriodKey:    "2026-04-07",
+		})
+	}()
+
+	<-stub.saveStarted
+	close(stub.releaseSave)
+
+	if err := <-restoreDone; err != nil {
+		t.Fatalf("restore state: %v", err)
+	}
+	if err := <-flushDone; err != nil {
+		t.Fatalf("flush pending after restore: %v", err)
+	}
+	if value := stub.store["2026-04-07"]["alice"]; value != 500 {
+		t.Fatalf("persisted value after interleaved flush = %d, want 500", value)
+	}
+}
+
+func TestServiceApplyDynamicUpdatesManager(t *testing.T) {
+	rawService, err := NewService(context.Background(), log.NewNOPFactory().Logger(), "quota", option.TrafficQuotaServiceOptions{})
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	s := rawService.(*Service)
+
+	if err := s.applyDynamic(dynamicconfig.ConfigRow{User: "alice", QuotaGB: 10, Period: "monthly"}); err != nil {
+		t.Fatalf("applyDynamic: %v", err)
+	}
+
+	if !s.manager.HasQuota("alice") {
+		t.Fatal("expected manager to have quota for alice after applyDynamic")
+	}
+	config, found := s.GetConfig("alice")
+	if !found {
+		t.Fatal("expected GetConfig to return config for alice")
+	}
+	if config.QuotaGB != 10 {
+		t.Errorf("expected QuotaGB=10, got %v", config.QuotaGB)
+	}
+}
+
+func TestServiceRemoveDynamicRemovesFromManager(t *testing.T) {
+	rawService, err := NewService(context.Background(), log.NewNOPFactory().Logger(), "quota", option.TrafficQuotaServiceOptions{})
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	s := rawService.(*Service)
+	// Assign a noop persister so removeConfigLocked doesn't panic on nil persister
+	s.persister = NewNoopPersister()
+
+	if err := s.applyDynamic(dynamicconfig.ConfigRow{User: "alice", QuotaGB: 10, Period: "monthly"}); err != nil {
+		t.Fatalf("applyDynamic: %v", err)
+	}
+	if !s.manager.HasQuota("alice") {
+		t.Fatal("expected alice to have quota before remove")
+	}
+
+	if err := s.removeDynamic("alice"); err != nil {
+		t.Fatalf("removeDynamic: %v", err)
+	}
+	if s.manager.HasQuota("alice") {
+		t.Fatal("expected alice quota to be removed after removeDynamic")
+	}
+}
+
+func TestServiceInitPersisterPostgresFallsBackToNoopPersister(t *testing.T) {
+	originalPostgresFactory := newPostgresPersisterFunc
+	t.Cleanup(func() {
+		newPostgresPersisterFunc = originalPostgresFactory
+	})
+	newPostgresPersisterFunc = func(context.Context, *option.TrafficQuotaPostgresOptions) (Persister, error) {
+		return nil, context.DeadlineExceeded
+	}
+
+	rawService, err := NewService(context.Background(), log.NewNOPFactory().Logger(), "quota", option.TrafficQuotaServiceOptions{
+		Persistence: &option.TrafficQuotaPersistence{
+			Postgres: &option.TrafficQuotaPostgresOptions{ConnectionString: "postgres://invalid:5432/nodb"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	s := rawService.(*Service)
+
+	if err := s.initPersister(); err != nil {
+		t.Fatalf("initPersister: %v", err)
+	}
+
+	if s.persister == nil {
+		t.Fatal("expected persister to be non-nil after initPersister")
+	}
+	if _, ok := s.persister.(*NoopPersister); !ok {
+		t.Fatalf("expected NoopPersister fallback, got %T", s.persister)
+	}
+	if err := s.persister.Save("alice", "2026-04", 100); err != nil {
+		t.Fatalf("Save on NoopPersister returned error: %v", err)
+	}
+}
+
 func newTestService(t *testing.T, options option.TrafficQuotaServiceOptions) *Service {
 	t.Helper()
 
@@ -156,9 +322,25 @@ type stubPersister struct {
 	deleteCalls []string
 }
 
+type blockingSavePersister struct {
+	*stubPersister
+	saveStarted chan struct{}
+	releaseSave chan struct{}
+	onSave      func()
+}
+
 func newStubPersister() *stubPersister {
 	return &stubPersister{
 		store: make(map[string]map[string]int64),
+	}
+}
+
+func newBlockingSavePersister(onSave func()) *blockingSavePersister {
+	return &blockingSavePersister{
+		stubPersister: newStubPersister(),
+		saveStarted:   make(chan struct{}),
+		releaseSave:   make(chan struct{}),
+		onSave:        onSave,
 	}
 }
 
@@ -185,6 +367,18 @@ func (p *stubPersister) Save(user, periodKey string, bytes int64) error {
 		p.store[periodKey] = make(map[string]int64)
 	}
 	p.store[periodKey][user] = bytes
+	return nil
+}
+
+func (p *blockingSavePersister) Save(user, periodKey string, bytes int64) error {
+	if err := p.stubPersister.Save(user, periodKey, bytes); err != nil {
+		return err
+	}
+	close(p.saveStarted)
+	if p.onSave != nil {
+		p.onSave()
+	}
+	<-p.releaseSave
 	return nil
 }
 
