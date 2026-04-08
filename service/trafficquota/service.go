@@ -116,6 +116,7 @@ func (s *Service) RestoreState(state RuntimeState) error {
 		if err := s.persister.Save(state.User.Name, periodKey, state.UsageBytes); err != nil {
 			return err
 		}
+		s.manager.ClearPendingDelta(state.User.Name)
 	}
 	return nil
 }

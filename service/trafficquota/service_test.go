@@ -135,6 +135,44 @@ func TestServiceInitPersisterFallsBackToNoopPersister(t *testing.T) {
 	}
 }
 
+func TestServiceRestoreStateDoesNotDoubleCountPendingDeltaAfterFlush(t *testing.T) {
+	service := newTestService(t, option.TrafficQuotaServiceOptions{
+		Users: []option.TrafficQuotaUser{
+			{Name: "alice", QuotaGB: quotaGB(2048), Period: "daily"},
+		},
+	})
+	service.manager.now = func() time.Time {
+		return time.Date(2026, 4, 7, 10, 0, 0, 0, time.UTC)
+	}
+	stub := newStubPersister()
+	service.persister = stub
+
+	err := service.RestoreState(RuntimeState{
+		User: option.TrafficQuotaUser{
+			Name:    "alice",
+			QuotaGB: quotaGB(2048),
+			Period:  "daily",
+		},
+		UsageBytes:   500,
+		PendingDelta: 200,
+		Exceeded:     false,
+		PeriodKey:    "2026-04-07",
+	})
+	if err != nil {
+		t.Fatalf("restore state: %v", err)
+	}
+	if value := stub.store["2026-04-07"]["alice"]; value != 500 {
+		t.Fatalf("persisted value after restore = %d, want 500", value)
+	}
+
+	if err := service.flushPending(); err != nil {
+		t.Fatalf("flush pending after restore: %v", err)
+	}
+	if value := stub.store["2026-04-07"]["alice"]; value != 500 {
+		t.Fatalf("persisted value after flush = %d, want 500", value)
+	}
+}
+
 func newTestService(t *testing.T, options option.TrafficQuotaServiceOptions) *Service {
 	t.Helper()
 

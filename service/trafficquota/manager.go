@@ -284,6 +284,14 @@ func (m *QuotaManager) RestoreState(state RuntimeState) error {
 	return nil
 }
 
+func (m *QuotaManager) ClearPendingDelta(user string) {
+	state, loaded := m.states.Load(user)
+	if !loaded {
+		return
+	}
+	state.pendingDelta.Store(0)
+}
+
 func (m *QuotaManager) HasQuota(user string) bool {
 	_, loaded := m.loadConfig(user)
 	return loaded
