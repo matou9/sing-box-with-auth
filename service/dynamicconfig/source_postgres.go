@@ -105,6 +105,7 @@ func (s *PostgresSource) Run(ctx context.Context) {
 // fetchAll loads all rows that have at least one non-zero config column.
 func (s *PostgresSource) fetchAll(ctx context.Context) error {
 	query := `SELECT name, COALESCE(upload_mbps,0), COALESCE(download_mbps,0),
+	                 per_client,
 	                 COALESCE(quota_gb,0), COALESCE(quota_period,''),
 	                 COALESCE(quota_period_start,''), COALESCE(quota_period_days,0)
 	          FROM ` + s.quotedTable + `
@@ -117,6 +118,7 @@ func (s *PostgresSource) fetchAll(ctx context.Context) error {
 	for rows.Next() {
 		var row ConfigRow
 		if err := rows.Scan(&row.User, &row.UploadMbps, &row.DownloadMbps,
+			&row.PerClient,
 			&row.QuotaGB, &row.Period, &row.PeriodStart, &row.PeriodDays); err != nil {
 			return E.Cause(err, "dynamic-config postgres scan row")
 		}
@@ -131,12 +133,14 @@ func (s *PostgresSource) fetchAll(ctx context.Context) error {
 // If the user no longer exists in the DB, it is removed from in-memory state.
 func (s *PostgresSource) fetchUser(ctx context.Context, user string) error {
 	query := `SELECT COALESCE(upload_mbps,0), COALESCE(download_mbps,0),
+	                 per_client,
 	                 COALESCE(quota_gb,0), COALESCE(quota_period,''),
 	                 COALESCE(quota_period_start,''), COALESCE(quota_period_days,0)
 	          FROM ` + s.quotedTable + ` WHERE name = $1`
 	row := ConfigRow{User: user}
 	err := s.pool.QueryRow(ctx, query, user).Scan(
 		&row.UploadMbps, &row.DownloadMbps,
+		&row.PerClient,
 		&row.QuotaGB, &row.Period, &row.PeriodStart, &row.PeriodDays,
 	)
 	if err != nil {

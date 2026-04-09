@@ -136,25 +136,32 @@
       "default": {
         "_comment": "未匹配任何用户/组时的兜底限速（0 = 不限）",
         "upload_mbps": 50,
-        "download_mbps": 50
+        "download_mbps": 50,
+        "_comment_per_client": "per_client=true 时，同一用户从不同 sing-box 客户端（不同源 IP）连入各自独享限速配额；false 时所有连接共享（默认）",
+        "per_client": true,
+        "_comment_client_ttl": "per_client 模式下不活跃的客户端 limiter 自动清理时间（分钟），默认 10",
+        "client_ttl_minutes": 10
       },
 
       "groups": [
         {
           "name": "premium",
           "upload_mbps": 500,
-          "download_mbps": 500
+          "download_mbps": 500,
+          "_comment_per_client": "继承 default 的 per_client 设置；设为 true/false 可覆盖",
+          "per_client": true
         },
         {
           "name": "basic",
           "upload_mbps": 10,
-          "download_mbps": 10
+          "download_mbps": 10,
+          "per_client": false
         }
       ],
 
       "users": [
         {
-          "_comment": "alice 属于 premium 组（继承组速率），也可单独覆盖",
+          "_comment": "alice 属于 premium 组（继承组 per_client=true），也可单独覆盖",
           "name": "alice",
           "group": "premium"
         },
@@ -163,10 +170,11 @@
           "group": "basic"
         },
         {
-          "_comment": "charlie 不属于任何组，单独指定速率",
+          "_comment": "charlie 不属于任何组，单独指定速率，per_client 覆盖为 false（所有终端共享限速）",
           "name": "charlie",
           "upload_mbps": 100,
-          "download_mbps": 200
+          "download_mbps": 200,
+          "per_client": false
         }
       ],
 

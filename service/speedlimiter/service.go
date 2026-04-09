@@ -104,6 +104,7 @@ func (s *Service) applyDynamic(row dynamicconfig.ConfigRow) error {
 		Name:         row.User,
 		UploadMbps:   row.UploadMbps,
 		DownloadMbps: row.DownloadMbps,
+		PerClient:    row.PerClient,
 	})
 }
 
@@ -156,7 +157,7 @@ func (s *Service) RoutedConnection(ctx context.Context, conn net.Conn, metadata 
 	if user == "" {
 		return conn
 	}
-	ul := s.manager.GetOrCreateLimiter(user)
+	ul := s.manager.GetOrCreateLimiterForClient(user, metadata.Source.Addr)
 	if ul == nil {
 		return conn
 	}
@@ -168,7 +169,7 @@ func (s *Service) RoutedPacketConnection(ctx context.Context, conn N.PacketConn,
 	if user == "" {
 		return conn
 	}
-	ul := s.manager.GetOrCreateLimiter(user)
+	ul := s.manager.GetOrCreateLimiterForClient(user, metadata.Source.Addr)
 	if ul == nil {
 		return conn
 	}

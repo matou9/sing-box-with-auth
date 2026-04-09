@@ -9,14 +9,17 @@ type SpeedLimiterServiceOptions struct {
 }
 
 type SpeedLimiterDefault struct {
-	UploadMbps   int `json:"upload_mbps,omitempty"`
-	DownloadMbps int `json:"download_mbps,omitempty"`
+	UploadMbps       int `json:"upload_mbps,omitempty"`
+	DownloadMbps     int `json:"download_mbps,omitempty"`
+	PerClient        bool `json:"per_client,omitempty"`
+	ClientTTLMinutes int  `json:"client_ttl_minutes,omitempty"`
 }
 
 type SpeedLimiterGroup struct {
 	Name         string `json:"name"`
 	UploadMbps   int    `json:"upload_mbps,omitempty"`
 	DownloadMbps int    `json:"download_mbps,omitempty"`
+	PerClient    *bool  `json:"per_client,omitempty"`
 }
 
 type SpeedLimiterUser struct {
@@ -24,6 +27,7 @@ type SpeedLimiterUser struct {
 	Group        string `json:"group,omitempty"`
 	UploadMbps   int    `json:"upload_mbps,omitempty"`
 	DownloadMbps int    `json:"download_mbps,omitempty"`
+	PerClient    *bool  `json:"per_client,omitempty"`
 }
 
 type SpeedLimiterSchedule struct {

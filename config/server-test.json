@@ -36,15 +36,15 @@
     {
       "type": "speed-limiter",
       "tag": "speed-limiter",
-      "default": { "upload_mbps": 20, "download_mbps": 20 },
+      "default": { "upload_mbps": 20, "download_mbps": 20, "per_client": true, "client_ttl_minutes": 10 },
       "groups": [
-        { "name": "premium", "upload_mbps": 200, "download_mbps": 200 },
-        { "name": "basic",   "upload_mbps": 5,   "download_mbps": 5   }
+        { "name": "premium", "upload_mbps": 200, "download_mbps": 200, "per_client": true },
+        { "name": "basic",   "upload_mbps": 5,   "download_mbps": 5,   "per_client": false }
       ],
       "users": [
         { "name": "alice",   "group": "premium" },
         { "name": "bob",     "group": "basic"   },
-        { "name": "charlie", "upload_mbps": 50, "download_mbps": 100 }
+        { "name": "charlie", "upload_mbps": 50, "download_mbps": 100, "per_client": false }
       ],
       "schedules": [
         {

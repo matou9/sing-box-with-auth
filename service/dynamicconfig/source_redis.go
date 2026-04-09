@@ -20,6 +20,7 @@ type redisMessage struct {
 	User         string  `json:"user"`
 	UploadMbps   int     `json:"upload_mbps,omitempty"`
 	DownloadMbps int     `json:"download_mbps,omitempty"`
+	PerClient    *bool   `json:"per_client,omitempty"`
 	QuotaGB      float64 `json:"quota_gb,omitempty"`
 	Period       string  `json:"period,omitempty"`
 	PeriodStart  string  `json:"period_start,omitempty"`
@@ -115,6 +116,7 @@ func (s *RedisSource) pollHash(ctx context.Context) error {
 			User:         msg.User,
 			UploadMbps:   msg.UploadMbps,
 			DownloadMbps: msg.DownloadMbps,
+			PerClient:    msg.PerClient,
 			QuotaGB:      msg.QuotaGB,
 			Period:       msg.Period,
 			PeriodStart:  msg.PeriodStart,
@@ -179,6 +181,7 @@ func (s *RedisSource) doSubscribe(ctx context.Context) error {
 				User:         parsed.User,
 				UploadMbps:   parsed.UploadMbps,
 				DownloadMbps: parsed.DownloadMbps,
+				PerClient:    parsed.PerClient,
 				QuotaGB:      parsed.QuotaGB,
 				Period:       parsed.Period,
 				PeriodStart:  parsed.PeriodStart,

@@ -6,6 +6,7 @@ type ConfigRow struct {
 	User         string
 	UploadMbps   int
 	DownloadMbps int
+	PerClient    *bool
 	QuotaGB      float64
 	Period       string
 	PeriodStart  string
