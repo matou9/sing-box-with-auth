@@ -22,3 +22,30 @@ CLAUDE.md
 AGENTS.md
 /.claude/
 /.worktrees/
+
+# Local agent / tooling state
+/.codex
+/.omc/
+/.omx/
+/test/.omc/
+
+# Build binaries and backups (root + build dirs)
+/*.exe
+/*.exe~
+/sing-box-linux-amd64
+/test/test.test
+/cmd/internal/build/*.exe
+
+# Logs and stray runtime output
+/*.log
+/nohup.out
+/nul
+/dbsetup.err
+/dbsetup.out
+/config/*.log
+
+# Local test scaffolding (mixed binaries, logs, and sample secrets)
+/test-all-features/
+/test-speedlimiter/
+/test-trafficquota/
+/test-userprovider/
