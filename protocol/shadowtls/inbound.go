@@ -6,6 +6,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
+	"github.com/sagernet/sing-box/common/compatible"
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/listener"
 	C "github.com/sagernet/sing-box/constant"
@@ -31,7 +32,7 @@ type Inbound struct {
 	router        adapter.Router
 	logger        logger.ContextLogger
 	listener      *listener.Listener
-	service       *shadowtls.Service
+	service       compatible.Map[string, *shadowtls.Service]
 	serviceConfig shadowtls.ServiceConfig
 }
 
@@ -86,11 +87,18 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		Handler:                (*inboundHandler)(inbound),
 		Logger:                 logger,
 	}
-	service, err := shadowtls.NewService(inbound.serviceConfig)
-	if err != nil {
-		return nil, err
+	// shadowtls v3 requires a non-empty users list at service construction time
+	// (enforced by the upstream library). When no inline users are provided we
+	// defer service creation until user-provider calls ReplaceUsers; other
+	// versions are constructed immediately because the upstream library does
+	// not validate users for v1/v2.
+	if !(options.Version == 3 && len(options.Users) == 0) {
+		service, err := shadowtls.NewService(inbound.serviceConfig)
+		if err != nil {
+			return nil, err
+		}
+		inbound.storeService(service)
 	}
-	inbound.service = service
 	inbound.listener = listener.New(listener.Options{
 		Context:           ctx,
 		Logger:            logger,
@@ -109,6 +117,7 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
 }
 
 func (h *Inbound) Close() error {
+	h.service.Delete("current")
 	return h.listener.Close()
 }
 
@@ -125,12 +134,19 @@ func (h *Inbound) ReplaceUsers(users []adapter.User) error {
 	if err != nil {
 		return err
 	}
-	h.service = service
+	h.storeService(service)
 	return nil
 }
 
 func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	err := h.service.NewConnection(adapter.WithContext(log.ContextWithNewID(ctx), &metadata), conn, metadata.Source, metadata.Destination, onClose)
+	service, _ := h.service.Load("current")
+	if service == nil {
+		err := E.New("shadowtls service not ready: waiting for user-provider users")
+		N.CloseOnHandshakeFailure(conn, onClose, err)
+		h.logger.WarnContext(ctx, E.Cause(err, "reject connection from ", metadata.Source))
+		return
+	}
+	err := service.NewConnection(adapter.WithContext(log.ContextWithNewID(ctx), &metadata), conn, metadata.Source, metadata.Destination, onClose)
 	N.CloseOnHandshakeFailure(conn, onClose, err)
 	if err != nil {
 		if E.IsClosedOrCanceled(err) {
@@ -139,6 +155,14 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 			h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
 		}
 	}
+}
+
+func (h *Inbound) storeService(service *shadowtls.Service) {
+	if service == nil {
+		h.service.Delete("current")
+		return
+	}
+	h.service.Store("current", service)
 }
 
 type inboundHandler Inbound

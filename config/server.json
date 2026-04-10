@@ -26,11 +26,14 @@
       }
     },
     {
-      "_comment": "Shadowsocks multi-user 入站：需配 method+password（服务端密钥），用户列表由 user-provider 接管，无需写 users",
+      "_comment": "Shadowsocks multi-user 入站：如需由 user-provider 接管，必须显式设置 managed=true；无需写 users",
       "type": "shadowsocks",
       "tag": "ss-in",
       "listen": "0.0.0.0",
       "listen_port": 8388,
+      "_comment_managed": "必须显式设置 managed=true，否则会按单用户入站创建，并在 user-provider 启动时因不支持 ManagedUserServer 而报错",
+      "managed": true,
+      "_comment_password": "2022 方法下 password 是服务端主 PSK；legacy AEAD 方法下，启用 managed 后实际鉴权以下发的每用户 password 为准",
       "method": "2022-blake3-aes-128-gcm",
       "password": "SERVER_BASE64_PASSWORD_HERE"
     },
@@ -77,6 +80,7 @@
       "tag": "user-provider",
       "inbounds": ["vless-ws-in", "ss-in", "trojan-in"],
 
+      "_comment_inbounds": "注意：ss-in 这种 shadowsocks 入站如需接入 user-provider，必须在对应 inbound 上显式写 managed=true",
       "users": [
         {
           "_comment": "alice：VLESS 使用 uuid，Shadowsocks/Trojan 使用 password",

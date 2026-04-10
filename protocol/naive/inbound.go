@@ -74,9 +74,9 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			return nil, E.New("TLS is required for QUIC server")
 		}
 	}
-	if len(options.Users) == 0 {
-		return nil, E.New("missing users")
-	}
+	// Empty users list is permitted: inline users or user-provider-managed users
+	// will be applied at runtime. Requests arriving before any users are
+	// configured are rejected by the authenticator with HTTP 407.
 	if options.TLS != nil {
 		tlsConfig, err := tls.NewServer(ctx, logger, common.PtrValueOrDefault(options.TLS))
 		if err != nil {

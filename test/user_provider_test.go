@@ -11,6 +11,9 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/protocol/naive"
+	"github.com/sagernet/sing-box/protocol/shadowsocks"
+	"github.com/sagernet/sing-box/protocol/shadowtls"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/json/badoption"
 
@@ -356,13 +359,14 @@ func TestUserProviderMultiInbound(t *testing.T) {
 }
 
 func TestUserProviderManagedUserServerInterface(t *testing.T) {
-	// Verify that all expected inbounds implement ManagedUserServer
-	users := []adapter.User{
-		{Name: "test", Password: "pass", UUID: "b831381d-6324-4d53-ad4f-8cda48b30811"},
-	}
-	_ = users
-	// This is a compile-time check via the var _ = (*Type)(nil) declarations
-	// in each protocol file. If they compile, the interface is satisfied.
+	_, shadowsocksManaged := any((*shadowsocks.MultiInbound)(nil)).(adapter.ManagedUserServer)
+	require.True(t, shadowsocksManaged, "shadowsocks.MultiInbound should implement ManagedUserServer")
+
+	_, naiveManaged := any((*naive.Inbound)(nil)).(adapter.ManagedUserServer)
+	require.True(t, naiveManaged, "naive.Inbound should implement ManagedUserServer")
+
+	_, shadowTLSManaged := any((*shadowtls.Inbound)(nil)).(adapter.ManagedUserServer)
+	require.True(t, shadowTLSManaged, "shadowtls.Inbound should implement ManagedUserServer")
 }
 
 func writeUserFile(t *testing.T, path string, users []option.User) {
