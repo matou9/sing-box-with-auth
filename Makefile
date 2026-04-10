@@ -16,6 +16,11 @@ LIBBOX_FFI_CONFIG ?= ./experimental/libbox/ffi.json
 
 TAGS_WINDOWS = with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_redis,with_postgres
 PARAMS_WINDOWS = -trimpath -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=$(VERSION)' $(LDFLAGS_SHARED) -s -w -buildid=" -tags "$(TAGS_WINDOWS)"
+TAGS_LINUX = $(TAGS_WINDOWS)
+PARAMS_LINUX = -trimpath -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=$(VERSION)' $(LDFLAGS_SHARED) -s -w -buildid=" -tags "$(TAGS_LINUX)"
+CC_LINUX ?= clang
+CXX_LINUX ?= clang++
+CGO_LDFLAGS_LINUX ?= -fuse-ld=lld
 
 .PHONY: test release docs build build-windows build-linux
 
@@ -29,7 +34,8 @@ build-windows:
 
 build-linux:
 	export GOTOOLCHAIN=local && \
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(PARAMS_WINDOWS) -o sing-box-linux-amd64 $(MAIN)
+	go clean -cache -testcache && \
+	CC=$(CC_LINUX) CXX=$(CXX_LINUX) CGO_ENABLED=1 CGO_LDFLAGS="$(CGO_LDFLAGS_LINUX)" GOOS=linux GOARCH=amd64 go build $(PARAMS_LINUX) -o sing-box-linux-amd64 $(MAIN)
 
 race:
 	export GOTOOLCHAIN=local && \
