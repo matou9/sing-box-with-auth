@@ -252,3 +252,374 @@ type stubQuotaTrackedConn struct {
 func (c *stubQuotaTrackedConn) markQuotaExceeded() {
 	c.closed.Add(1)
 }
+
+// TestQuotaManagerRegisterConnRemoveConfigNoOrphan covers Unit 6 of the
+// 2026-05-14 memory-leak plan: when RegisterConn and RemoveConfig race
+// on the same user, no conn that successfully completed registration
+// (i.e. RegisterConn returned non-nil callbacks) may be left as an
+// "orphan" — a conn still attached to a connList that was unlinked from
+// activeConns before closeAllAndClear ran. Pre-fix, the orphan path was
+// real: a goroutine could LoadOrStore the connList, get scheduled out,
+// see RemoveConfig run to completion, then add to a list that nobody
+// would ever notify again.
+//
+// The lifecycle RWMutex closes that window: RegisterConn holds RLock
+// across its full load → add sequence; RemoveConfig holds Lock across
+// the LoadAndDelete map swap. The invariant guarded here is structural,
+// so we run the race many times to amplify scheduling variance.
+func TestQuotaManagerRegisterConnRemoveConfigNoOrphan(t *testing.T) {
+	for attempt := 0; attempt < 16; attempt++ {
+		manager, err := NewQuotaManager(option.TrafficQuotaServiceOptions{
+			Users: []option.TrafficQuotaUser{
+				{Name: "alice", QuotaGB: quotaGB(1024), Period: "daily"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("attempt %d: new manager: %v", attempt, err)
+		}
+
+		const workers = 64
+		var (
+			registered   []*stubQuotaTrackedConn
+			registeredMu sync.Mutex
+			wg           sync.WaitGroup
+			startBarrier = make(chan struct{})
+		)
+
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-startBarrier
+				conn := &stubQuotaTrackedConn{}
+				onBytes, onClose := manager.RegisterConn("alice", conn)
+				if onBytes == nil || onClose == nil {
+					// Config was already removed when this worker ran;
+					// the conn was never tracked, so the orphan invariant
+					// does not apply to it.
+					return
+				}
+				registeredMu.Lock()
+				registered = append(registered, conn)
+				registeredMu.Unlock()
+			}()
+		}
+
+		// Release workers and RemoveConfig simultaneously to maximize
+		// interleaving across runs.
+		go func() {
+			<-startBarrier
+			if err := manager.RemoveConfig("alice"); err != nil {
+				t.Errorf("attempt %d: RemoveConfig: %v", attempt, err)
+			}
+		}()
+		close(startBarrier)
+		wg.Wait()
+		// Give the RemoveConfig goroutine a fair chance to complete its
+		// closeAllAndClear after all RegisterConn workers exit. The
+		// lifecycle Lock guarantees serialization, but closeAllAndClear
+		// runs outside the lock, so we wait until activeConns has been
+		// emptied — that means closeAllAndClear has at least started.
+		waitForRemovalCompletion(t, manager, "alice")
+
+		registeredMu.Lock()
+		orphans := 0
+		for i, conn := range registered {
+			if got := conn.closed.Load(); got == 0 {
+				t.Errorf("attempt %d: conn %d/%d (registered) was orphaned — never received markQuotaExceeded", attempt, i, len(registered))
+				orphans++
+			}
+		}
+		count := len(registered)
+		registeredMu.Unlock()
+		if orphans > 0 {
+			t.Fatalf("attempt %d: %d orphan(s) out of %d registered conns", attempt, orphans, count)
+		}
+	}
+}
+
+func waitForRemovalCompletion(t *testing.T, manager *QuotaManager, user string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, loaded := manager.activeConns.Load(user); !loaded {
+			// The activeConns entry has been removed by RemoveConfig.
+			// closeAllAndClear runs synchronously inside RemoveConfig
+			// before the map entry is gone — wait, that order isn't
+			// guaranteed. Re-read the implementation: LoadAndDelete
+			// happens BEFORE closeAllAndClear, so the entry is gone
+			// first. We need a different signal — give a small grace
+			// period for closeAllAndClear to finish marking.
+			time.Sleep(10 * time.Millisecond)
+			return
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+	t.Fatalf("RemoveConfig did not complete for user %q within deadline", user)
+}
+
+// TestQuotaManagerRegisterConnAfterRemoveConfigReturnsNoCallbacks
+// guards the inverse half of Unit 6: once RemoveConfig has completed,
+// any subsequent RegisterConn for that user must observe loadConfig ==
+// false and return nil callbacks. Without lifecycle, a stale read of
+// userConfigs could let a late RegisterConn build a fresh connList that
+// nobody owns.
+func TestQuotaManagerRegisterConnAfterRemoveConfigReturnsNoCallbacks(t *testing.T) {
+	manager, err := NewQuotaManager(option.TrafficQuotaServiceOptions{
+		Users: []option.TrafficQuotaUser{
+			{Name: "alice", QuotaGB: quotaGB(1024), Period: "daily"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	if err := manager.RemoveConfig("alice"); err != nil {
+		t.Fatalf("RemoveConfig: %v", err)
+	}
+
+	conn := &stubQuotaTrackedConn{}
+	onBytes, onClose := manager.RegisterConn("alice", conn)
+	if onBytes != nil || onClose != nil {
+		t.Fatalf("expected nil callbacks for unconfigured user, got (%v, %v)", onBytes != nil, onClose != nil)
+	}
+
+	// And re-applying config should let RegisterConn succeed again
+	// against a *fresh* connList (the previous list is gone).
+	if err := manager.ApplyConfig(option.TrafficQuotaUser{
+		Name:    "alice",
+		QuotaGB: quotaGB(1024),
+		Period:  "daily",
+	}); err != nil {
+		t.Fatalf("re-apply: %v", err)
+	}
+	conn2 := &stubQuotaTrackedConn{}
+	onBytes2, onClose2 := manager.RegisterConn("alice", conn2)
+	if onBytes2 == nil || onClose2 == nil {
+		t.Fatal("expected non-nil callbacks after re-apply")
+	}
+	onClose2()
+}
+
+// TestConnListRemoveDoesNotAffectOtherConns covers Unit 3 Safety Proof
+// P3: a remove() of conn A must not let closeAll skip a still-present
+// conn B, and a removed conn must not receive a markQuotaExceeded.
+//
+// The test adds 100 conns, removes a deterministic half by identity,
+// then closeAll's the list and checks that exactly the removed conns
+// are absent from the notification set.
+func TestConnListRemoveDoesNotAffectOtherConns(t *testing.T) {
+	l := &connList{}
+	conns := make([]*stubQuotaTrackedConn, 100)
+	for i := range conns {
+		conns[i] = &stubQuotaTrackedConn{}
+		l.add(conns[i])
+	}
+	// Remove every other conn (indices 0, 2, 4, ...).
+	for i := 0; i < len(conns); i += 2 {
+		l.remove(conns[i])
+	}
+	l.closeAll()
+	for i, c := range conns {
+		expected := int64(0)
+		if i%2 == 1 {
+			expected = 1
+		}
+		if got := c.closed.Load(); got != expected {
+			t.Fatalf("conn[%d]: expected markQuotaExceeded count=%d, got %d", i, expected, got)
+		}
+	}
+}
+
+// TestConnListShrinksUnderwater covers Unit 3 Safety Proof P4: a list
+// that grew large and then drained must release the oversized backing
+// array.
+func TestConnListShrinksUnderwater(t *testing.T) {
+	l := &connList{}
+	const grown = 2048
+	conns := make([]*stubQuotaTrackedConn, grown)
+	for i := range conns {
+		conns[i] = &stubQuotaTrackedConn{}
+		l.add(conns[i])
+	}
+	peakCap := capUnderLock(l)
+	if peakCap <= connListShrinkMinCap {
+		t.Fatalf("test precondition: peak cap %d should exceed shrink min %d", peakCap, connListShrinkMinCap)
+	}
+	// Remove all but a small remainder; shrink must trigger.
+	for i := 0; i < grown-8; i++ {
+		l.remove(conns[i])
+	}
+	if got := capUnderLock(l); got >= peakCap {
+		t.Fatalf("expected backing array to shrink below peak cap %d, got %d", peakCap, got)
+	}
+	if got := l.len(); got != 8 {
+		t.Fatalf("expected len=8 after draining, got %d", got)
+	}
+}
+
+// TestConnListRemoveZerosLastSlot covers Unit 3 Safety Proof P1: the
+// slot that was swapped out of the active region must be set to nil so
+// the interface value (and the *QuotaConn it references) becomes
+// eligible for GC.
+func TestConnListRemoveZerosLastSlot(t *testing.T) {
+	l := &connList{}
+	c1 := &stubQuotaTrackedConn{}
+	c2 := &stubQuotaTrackedConn{}
+	c3 := &stubQuotaTrackedConn{}
+	l.add(c1)
+	l.add(c2)
+	l.add(c3)
+
+	l.remove(c2)
+
+	// Inspect the trailing slot (index len(l.conns)) under the lock.
+	l.access.Lock()
+	if cap(l.conns) <= len(l.conns) {
+		l.access.Unlock()
+		t.Fatalf("expected trailing capacity to inspect")
+	}
+	if trailing := l.conns[len(l.conns):cap(l.conns)][0]; trailing != nil {
+		l.access.Unlock()
+		t.Fatalf("expected trailing slot to be nil after swap-and-zero, got %T", trailing)
+	}
+	l.access.Unlock()
+
+	if l.len() != 2 {
+		t.Fatalf("expected len=2 after removing one conn, got %d", l.len())
+	}
+}
+
+// TestConnListRemoveNeverAddedIsNoop covers Unit 3 Safety Proof P2: a
+// remove of an interface value that never matched any element must not
+// mutate the list.
+func TestConnListRemoveNeverAddedIsNoop(t *testing.T) {
+	l := &connList{}
+	c1 := &stubQuotaTrackedConn{}
+	c2 := &stubQuotaTrackedConn{}
+	l.add(c1)
+
+	stranger := &stubQuotaTrackedConn{}
+	l.remove(stranger)
+
+	if l.len() != 1 {
+		t.Fatalf("expected len unchanged, got %d", l.len())
+	}
+	// The original conn must still be there; closeAll proves it.
+	l.closeAll()
+	if c1.closed.Load() != 1 {
+		t.Fatal("expected original conn to still be tracked")
+	}
+	if c2.closed.Load() != 0 {
+		t.Fatal("uninvolved conn should remain unmarked")
+	}
+}
+
+// TestConnListCloseAllAndClearDropsReferences covers the
+// closeAllAndClear contract: after the call returns, the list owns no
+// references to the previously tracked conns. This is what protects
+// RemoveConfig against sync.Map.Delete's lazy release.
+func TestConnListCloseAllAndClearDropsReferences(t *testing.T) {
+	l := &connList{}
+	conns := make([]*stubQuotaTrackedConn, 20)
+	for i := range conns {
+		conns[i] = &stubQuotaTrackedConn{}
+		l.add(conns[i])
+	}
+
+	l.closeAllAndClear()
+
+	for i, c := range conns {
+		if got := c.closed.Load(); got != 1 {
+			t.Fatalf("conn[%d]: expected markQuotaExceeded count=1, got %d", i, got)
+		}
+	}
+	l.access.Lock()
+	if l.conns != nil {
+		l.access.Unlock()
+		t.Fatalf("expected l.conns to be nil after closeAllAndClear, got len=%d cap=%d", len(l.conns), cap(l.conns))
+	}
+	l.access.Unlock()
+}
+
+// TestConnListConcurrentAddRemoveCloseAll exercises the concurrent
+// invariants of Unit 3: add / remove / closeAll racing on the same list
+// must not corrupt state, panic on a nil slot, or double-mark conns.
+// (A separate -race run will catch data races once a cgo toolchain is
+// installed; this test guards correctness even without the race
+// detector.)
+func TestConnListConcurrentAddRemoveCloseAll(t *testing.T) {
+	l := &connList{}
+	const writers = 16
+	const opsPerWriter = 200
+
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < opsPerWriter; i++ {
+				c := &stubQuotaTrackedConn{}
+				l.add(c)
+				l.remove(c)
+			}
+		}()
+	}
+	// One goroutine periodically calls closeAll while writers churn.
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				l.closeAll()
+			}
+		}
+	}()
+	wg.Wait()
+	close(stop)
+
+	if got := l.len(); got != 0 {
+		t.Fatalf("expected list empty after all add/remove pairs balanced, got %d", got)
+	}
+}
+
+// TestConnListShrinkDoesNotThrash covers Unit 3 TC6: repeated add/remove
+// cycles at a stable working-set size should not cause the cap to grow
+// without bound nor trigger shrink on every cycle. We assert that the
+// cap stays within a reasonable envelope once it converges.
+func TestConnListShrinkDoesNotThrash(t *testing.T) {
+	l := &connList{}
+	const cycles = 100
+	const batch = 50
+	const remove = 40
+
+	conns := make([]*stubQuotaTrackedConn, 0, batch)
+	for c := 0; c < cycles; c++ {
+		for i := 0; i < batch; i++ {
+			cc := &stubQuotaTrackedConn{}
+			conns = append(conns, cc)
+			l.add(cc)
+		}
+		for i := 0; i < remove; i++ {
+			l.remove(conns[len(conns)-1-i])
+		}
+		conns = conns[:len(conns)-remove]
+	}
+	// Working-set size after 100 cycles: 100 * (batch - remove) = 1000.
+	// cap must accommodate the live set but not be many multiples larger.
+	c := capUnderLock(l)
+	if c < l.len() {
+		t.Fatalf("cap=%d < len=%d", c, l.len())
+	}
+	if c > 16*l.len() {
+		t.Fatalf("cap=%d unreasonably larger than len=%d", c, l.len())
+	}
+}
+
+func capUnderLock(l *connList) int {
+	l.access.Lock()
+	defer l.access.Unlock()
+	return cap(l.conns)
+}

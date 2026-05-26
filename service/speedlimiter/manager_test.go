@@ -412,7 +412,8 @@ func TestManager_ScheduleLoop(t *testing.T) {
 	assertRate(t, "before schedule upload", ul.Upload, 10)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	m.StartScheduleLoop(ctx)
+	var wg sync.WaitGroup
+	m.StartScheduleLoop(ctx, &wg)
 
 	// Give it a moment to do initial check
 	time.Sleep(200 * time.Millisecond)
@@ -421,6 +422,7 @@ func TestManager_ScheduleLoop(t *testing.T) {
 	assertRate(t, "schedule active upload", ul.Upload, 5)
 
 	cancel()
+	wg.Wait()
 }
 
 // parseTime edge cases

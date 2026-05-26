@@ -85,6 +85,49 @@ func (p *PostgresPersister) LoadAll(periodKey string) (map[string]int64, error) 
 	return result, nil
 }
 
+// LoadMany batches WHERE user_name = ANY($2) queries so the flush hot
+// path scales with the dirty-user count instead of the total user set.
+// Each query covers at most loadManyBatchSize users to keep the
+// parameter array bounded; pgx encodes []string as text[] automatically.
+func (p *PostgresPersister) LoadMany(periodKey string, users []string) (map[string]int64, error) {
+	if len(users) == 0 {
+		return map[string]int64{}, nil
+	}
+	result := make(map[string]int64, len(users))
+	query := "SELECT user_name, bytes_used FROM " + p.table + " WHERE period_key = $1 AND user_name = ANY($2)"
+	for start := 0; start < len(users); start += loadManyBatchSize {
+		end := start + loadManyBatchSize
+		if end > len(users) {
+			end = len(users)
+		}
+		batch := users[start:end]
+		if err := p.loadManyBatch(query, periodKey, batch, result); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func (p *PostgresPersister) loadManyBatch(query, periodKey string, batch []string, result map[string]int64) error {
+	rows, err := p.pool.Query(p.ctx, query, periodKey, batch)
+	if err != nil {
+		return E.Cause(err, "query PostgreSQL traffic quota rows (batch)")
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var user string
+		var bytes int64
+		if scanErr := rows.Scan(&user, &bytes); scanErr != nil {
+			return E.Cause(scanErr, "scan PostgreSQL traffic quota row (batch)")
+		}
+		result[user] = bytes
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return E.Cause(rowsErr, "iterate PostgreSQL traffic quota rows (batch)")
+	}
+	return nil
+}
+
 func (p *PostgresPersister) Save(user, periodKey string, bytes int64) error {
 	query := "INSERT INTO " + p.table + " (user_name, period_key, bytes_used, updated_at) VALUES ($1, $2, $3, NOW()) " +
 		"ON CONFLICT (user_name, period_key) DO UPDATE SET bytes_used = EXCLUDED.bytes_used, updated_at = NOW()"

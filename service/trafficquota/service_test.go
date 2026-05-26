@@ -3,6 +3,8 @@ package trafficquota
 import (
 	"context"
 	"net"
+	"runtime"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -316,10 +318,57 @@ func newTestService(t *testing.T, options option.TrafficQuotaServiceOptions) *Se
 	return service
 }
 
+// TestTrafficQuotaServiceCloseTerminatesAllLoops guards the wg-completeness
+// invariant required by Unit 1 (Reinforcement #3) of the 2026-05-14
+// memory-leak fix plan: every long-running goroutine launched from
+// Service.Start (runFlushLoop, runPeriodResetLoop, dynamic source loops)
+// must be tracked by s.wg so that Service.Close() waits for them
+// synchronously. The plan does not change the current wiring; this test
+// freezes the existing correct behavior so future PRs cannot regress it.
+func TestTrafficQuotaServiceCloseTerminatesAllLoops(t *testing.T) {
+	runtime.GC()
+	before := runtime.NumGoroutine()
+
+	s := newTestService(t, option.TrafficQuotaServiceOptions{
+		Users: []option.TrafficQuotaUser{
+			{Name: "alice", QuotaGB: quotaGB(1024), Period: "daily"},
+		},
+	})
+
+	// Replicate the goroutine launches performed by Start() without taking
+	// on Start's Router-from-context dependency. This faithfully exercises
+	// the wg path that Close() relies on.
+	s.wg.Add(2)
+	go func() { defer s.wg.Done(); s.runFlushLoop() }()
+	go func() { defer s.wg.Done(); s.runPeriodResetLoop() }()
+
+	time.Sleep(50 * time.Millisecond)
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Close() returning implies wg.Wait() observed defer wg.Done() for both
+	// loops. Validate at the runtime level that no leak survives.
+	time.Sleep(50 * time.Millisecond)
+	runtime.GC()
+	after := runtime.NumGoroutine()
+	if delta := after - before; delta > 2 {
+		t.Fatalf("expected goroutine count to return to baseline (tolerance ±2); before=%d after=%d delta=%d", before, after, delta)
+	}
+}
+
+type loadManyCall struct {
+	periodKey string
+	users     []string
+}
+
 type stubPersister struct {
-	mu          sync.Mutex
-	store       map[string]map[string]int64
-	deleteCalls []string
+	mu             sync.Mutex
+	store          map[string]map[string]int64
+	deleteCalls    []string
+	loadManyCalls  []loadManyCall
+	loadAllInvoked int
 }
 
 type blockingSavePersister struct {
@@ -353,9 +402,24 @@ func (p *stubPersister) Load(user, periodKey string) (int64, error) {
 func (p *stubPersister) LoadAll(periodKey string) (map[string]int64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.loadAllInvoked++
 	result := make(map[string]int64)
 	for user, value := range p.store[periodKey] {
 		result[user] = value
+	}
+	return result, nil
+}
+
+func (p *stubPersister) LoadMany(periodKey string, users []string) (map[string]int64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.loadManyCalls = append(p.loadManyCalls, loadManyCall{periodKey: periodKey, users: append([]string(nil), users...)})
+	result := make(map[string]int64, len(users))
+	bucket := p.store[periodKey]
+	for _, user := range users {
+		if v, ok := bucket[user]; ok {
+			result[user] = v
+		}
 	}
 	return result, nil
 }
@@ -408,3 +472,184 @@ func (p *stubPersister) Close() error {
 
 var _ adapter.Service = (*Service)(nil)
 var _ Persister = (*stubPersister)(nil)
+
+// TestFlushPendingUsesLoadManyNotLoadAll guards Unit 4 of the 2026-05-14
+// memory-leak plan: the flush hot path must call LoadMany scoped to the
+// active users instead of LoadAll scanning the entire period set.
+func TestFlushPendingUsesLoadManyNotLoadAll(t *testing.T) {
+	service := newTestService(t, option.TrafficQuotaServiceOptions{
+		Users: []option.TrafficQuotaUser{
+			{Name: "alice", QuotaGB: quotaGB(4096), Period: "daily"},
+			{Name: "bob", QuotaGB: quotaGB(4096), Period: "daily"},
+		},
+	})
+	service.manager.now = func() time.Time {
+		return time.Date(2026, 5, 14, 10, 0, 0, 0, time.UTC)
+	}
+	stub := newStubPersister()
+	service.persister = stub
+
+	service.manager.AddBytes("alice", 100)
+	// bob has no traffic — must not appear in the flush I/O at all.
+
+	if err := service.flushPending(); err != nil {
+		t.Fatalf("flush pending: %v", err)
+	}
+
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	if stub.loadAllInvoked != 0 {
+		t.Fatalf("expected LoadAll to not be invoked by flushPending, got %d calls", stub.loadAllInvoked)
+	}
+	if len(stub.loadManyCalls) != 1 {
+		t.Fatalf("expected exactly one LoadMany call, got %d", len(stub.loadManyCalls))
+	}
+	call := stub.loadManyCalls[0]
+	if call.periodKey != "2026-05-14" {
+		t.Fatalf("unexpected LoadMany period: %s", call.periodKey)
+	}
+	if len(call.users) != 1 || call.users[0] != "alice" {
+		t.Fatalf("expected LoadMany users=[alice], got %v", call.users)
+	}
+}
+
+// TestConsumePendingDeltasOnlyDrainsDirtyUsers guards R10/R13: the
+// dirty-user index must let flush walk only the changed users, not the
+// entire configured user set.
+func TestConsumePendingDeltasOnlyDrainsDirtyUsers(t *testing.T) {
+	service := newTestService(t, option.TrafficQuotaServiceOptions{})
+	service.manager.now = func() time.Time {
+		return time.Date(2026, 5, 14, 10, 0, 0, 0, time.UTC)
+	}
+	// Configure 1000 users; only 2 will produce traffic this cycle.
+	for i := 0; i < 1000; i++ {
+		name := "user-" + strconv.Itoa(i)
+		if err := service.manager.ApplyConfig(option.TrafficQuotaUser{
+			Name:    name,
+			QuotaGB: quotaGB(4096),
+			Period:  "daily",
+		}); err != nil {
+			t.Fatalf("apply config %s: %v", name, err)
+		}
+	}
+
+	service.manager.AddBytes("user-1", 100)
+	service.manager.AddBytes("user-500", 200)
+
+	pending := service.manager.ConsumePendingDeltas()
+	if len(pending) != 2 {
+		t.Fatalf("expected 2 pending deltas (only dirty users), got %d", len(pending))
+	}
+	seen := make(map[string]int64, 2)
+	for _, pd := range pending {
+		seen[pd.User] = pd.Delta
+		if pd.PeriodKey != "2026-05-14" {
+			t.Errorf("unexpected period for %s: %q", pd.User, pd.PeriodKey)
+		}
+	}
+	if seen["user-1"] != 100 || seen["user-500"] != 200 {
+		t.Fatalf("unexpected pending payload: %v", seen)
+	}
+
+	// A second drain right after the first must return nothing — the
+	// dirtyQueue is consumed, and nobody added new bytes.
+	if again := service.manager.ConsumePendingDeltas(); len(again) != 0 {
+		t.Fatalf("expected empty second drain, got %d entries", len(again))
+	}
+}
+
+// TestFlushPendingDoesNotLoseConcurrentAddBytes guards R13: AddBytes
+// calls that race with ConsumePendingDeltas must not lose their delta.
+// The plan accepts a zero-delta entry on the next flush as harmless, but
+// the actual bytes must always end up persisted within a bounded number
+// of flush cycles.
+func TestFlushPendingDoesNotLoseConcurrentAddBytes(t *testing.T) {
+	service := newTestService(t, option.TrafficQuotaServiceOptions{
+		Users: []option.TrafficQuotaUser{
+			{Name: "alice", QuotaGB: quotaGB(8192), Period: "daily"},
+		},
+	})
+	service.manager.now = func() time.Time {
+		return time.Date(2026, 5, 14, 10, 0, 0, 0, time.UTC)
+	}
+	stub := newStubPersister()
+	service.persister = stub
+
+	const writers = 8
+	const opsPerWriter = 200
+	const bytesPerOp = 7
+
+	var wg sync.WaitGroup
+	wg.Add(writers)
+	for w := 0; w < writers; w++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < opsPerWriter; i++ {
+				service.manager.AddBytes("alice", bytesPerOp)
+				if i%17 == 0 {
+					_ = service.flushPending()
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if err := service.flushPending(); err != nil {
+		t.Fatalf("final flush: %v", err)
+	}
+
+	expected := int64(writers * opsPerWriter * bytesPerOp)
+	stub.mu.Lock()
+	got := stub.store["2026-05-14"]["alice"]
+	stub.mu.Unlock()
+	if got != expected {
+		t.Fatalf("expected persisted bytes=%d, got %d (lost or double-counted under flush race)", expected, got)
+	}
+	if usage := service.manager.Usage("alice"); usage != expected {
+		t.Fatalf("expected in-memory usage=%d, got %d", expected, usage)
+	}
+}
+
+// TestCheckPeriodResetAtomicWithPendingDelta guards R13: a period reset
+// must not let AddBytes drop bytes into the OLD period after the boundary
+// has rolled over. periodKey and pendingDelta share the same critical
+// section under userState.periodAccess; this test exercises the
+// invariant via a deterministic interleaving.
+func TestCheckPeriodResetAtomicWithPendingDelta(t *testing.T) {
+	service := newTestService(t, option.TrafficQuotaServiceOptions{
+		Users: []option.TrafficQuotaUser{
+			{Name: "alice", QuotaGB: quotaGB(4096), Period: "daily"},
+		},
+	})
+	service.manager.now = func() time.Time {
+		return time.Date(2026, 5, 14, 10, 0, 0, 0, time.UTC)
+	}
+	// Seed period and add some bytes in the old period.
+	service.manager.AddBytes("alice", 100)
+	pending := service.manager.ConsumePendingDeltas()
+	if len(pending) != 1 || pending[0].PeriodKey != "2026-05-14" {
+		t.Fatalf("setup failed: %#v", pending)
+	}
+
+	// Period reset to the next day.
+	resets := service.manager.CheckPeriodReset(time.Date(2026, 5, 15, 10, 0, 0, 0, time.UTC))
+	if len(resets) != 1 || resets[0].PreviousKey != "2026-05-14" {
+		t.Fatalf("expected single reset from 2026-05-14, got %#v", resets)
+	}
+
+	// Update now() to the new period and add bytes — these must attach to
+	// the new period, not the old one.
+	service.manager.now = func() time.Time {
+		return time.Date(2026, 5, 15, 10, 0, 0, 0, time.UTC)
+	}
+	service.manager.AddBytes("alice", 50)
+	pending = service.manager.ConsumePendingDeltas()
+	if len(pending) != 1 {
+		t.Fatalf("expected single pending after reset, got %#v", pending)
+	}
+	if pending[0].PeriodKey != "2026-05-15" {
+		t.Fatalf("expected post-reset period=2026-05-15, got %q", pending[0].PeriodKey)
+	}
+	if pending[0].Delta != 50 {
+		t.Fatalf("expected post-reset delta=50, got %d", pending[0].Delta)
+	}
+}

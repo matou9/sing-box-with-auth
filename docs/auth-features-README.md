@@ -872,3 +872,58 @@ ERROR connection: connection upload closed: traffic quota exceeded
 # Redis 连接失败（自动降级为内存模式）
 WARN service/traffic-quota[tq]: traffic-quota redis unavailable, falling back to memory mode: ...
 ```
+
+---
+
+## 容量与运维约束
+
+> 本节由 2026-05-14 内存泄漏修复计划（Unit 7）固化，描述新增的稳态约束。
+
+### 用户名集合需保持有界
+
+`user-provider` 推送的用户名集合是 `speed-limiter` / `traffic-quota` 的容量上界：
+
+- **speed-limiter**：每个独立用户在 `LimiterManager.limiters` 中保留一份 `*UserLimiter`（约几十字节 + 内部令牌桶状态）。**per-user 限流器永不 TTL 清理**——仅在 `RemoveConfig`（动态删除用户）时移除。per-client 限流器（带 IP 后缀的 key）有独立的 TTL 清理路径。
+- **traffic-quota**：每个有过流量记录的用户在 `activeConns` 与 `states` 两张 `compatible.Map` 中各保留一份条目，加上 `connList` 的底层数组（Unit 3 后可自动 shrink）。删除路径同样是 `RemoveConfig`。
+
+**实际建议**：
+
+| 单实例稳态用户数 | 内存预算（约） | 备注 |
+|----------------|--------------|------|
+| ≤ 1 万 | < 50 MB | 默认场景，无需额外评估 |
+| 1 万 – 10 万 | 50 MB – 500 MB | 建议监控 RSS 与 `pprof heap` |
+| > 10 万 | 需评估 | `sync.Map` 不收缩特性会让历史用户峰值持续占用——见下文 |
+
+### 历史峰值与 `sync.Map` 边界
+
+`activeConns` / `states` 基于 `sync.Map`。stdlib 的 `sync.Map` 在大量 `Store` + `Delete` 抖动后**底层 read/dirty 数组不会主动收缩**。Unit 3 已通过 `closeAllAndClear` 清空 value 内部状态来避免连接对象残留引用，但 sync.Map 自身的条目槽仍会随历史峰值保留：
+
+- 若用户总 churn（添加+删除累计）**< 10 万**，影响可忽略
+- 若 churn **> 10 万**，可能出现"RSS 居高不降"的可观察症状
+- 判定方法：`pprof heap` 查看 `sync.Map.dirty` / `sync.Map.read` 占比 > 10% 时属于此场景
+
+该问题不在本次修复范围。如需在大规模 churn 场景下解决，建议方案：
+1. 周期性整体重建 `activeConns` / `states`（迁移条目到新 map，丢弃旧 map）
+2. 自实现支持收缩的并发 map
+
+### 管理面 HTTP 资源边界
+
+`admin-api` 服务对外暴露 HTTP 管理接口。Unit 8 已为 `http.Server` 配置保守超时（`ReadHeaderTimeout` / `ReadTimeout` / `IdleTimeout`）与请求体大小上限（`MaxBytesReader`），以避免：
+
+- 慢请求长时间占用连接（攻击或异常客户端）
+- 单次请求 body 超大导致 RSS 尖峰
+
+如果有合法的大批量 user create/update 操作需求（超过默认 body limit 1 MiB），建议拆分为多次请求，而不是放宽 limit——后者会重新引入资源耗尽风险。
+
+### 关键日志关键字
+
+```
+# 用户提供者推送（容量监控点）
+INFO service/user-provider[up]: pushed 2 users to 9 inbound(s)
+
+# Redis 连接失败（自动降级为内存模式）
+WARN service/traffic-quota[tq]: traffic-quota redis unavailable, falling back to memory mode: ...
+
+# admin-api 请求体超限
+ERROR service/admin-api[am]: request body too large
+```

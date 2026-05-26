@@ -24,6 +24,30 @@ import (
 
 const defaultBasePath = "/admin/v1"
 
+// Resource bounds for the admin-api HTTP server. Unit 8 of the
+// 2026-05-14 memory-leak plan adds these to keep the management plane
+// from being held open indefinitely by slow clients or held large by a
+// single oversized request. Values are intentionally conservative — they
+// cover normal management traffic (login, single user CRUD, schedule
+// updates) with comfortable headroom but reject pathological cases.
+const (
+	adminAPIReadHeaderTimeout = 10 * time.Second
+	adminAPIReadTimeout       = 30 * time.Second
+	adminAPIIdleTimeout       = 60 * time.Second
+
+	// adminAPIMaxRequestBytes caps the size of a single decoded request
+	// body. 1 MiB is well above any realistic admin operation (a single
+	// user record is well under 1 KiB; a bulk schedule update is rarely
+	// larger than 10 KiB) while keeping a hostile payload from forcing
+	// RSS to spike. Exposed as a variable so tests can shrink it.
+	defaultAdminAPIMaxRequestBytes int64 = 1 << 20
+)
+
+// adminAPIMaxRequestBytes is the active body-size cap. Mutable so tests
+// can scope down to a few hundred bytes without fabricating MiBs of
+// JSON payload. Production callers never change it.
+var adminAPIMaxRequestBytes = defaultAdminAPIMaxRequestBytes
+
 func RegisterService(registry *boxService.Registry) {
 	boxService.Register[option.AdminAPIServiceOptions](registry, C.TypeAdminAPI, NewService)
 }
@@ -84,6 +108,12 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 		listenAddr:     options.Listen,
 	}
 	router := chi.NewRouter()
+	// bodyLimitMiddleware sits in front of every handler and wraps the
+	// request body so any read past adminAPIMaxRequestBytes fails with
+	// "http: request body too large". The handlers already map decode
+	// errors to 400 BadRequest, which keeps the response shape unchanged
+	// for legitimate small requests while bounding worst-case allocation.
+	router.Use(bodyLimitMiddleware)
 	router.Route(svc.basePath, func(baseRouter chi.Router) {
 		baseRouter.Handle("/auth/login", postOnly(http.HandlerFunc(authenticator.LoginHandler)))
 		baseRouter.Handle("/user/list", svc.authenticatedPost(http.HandlerFunc(svc.ListUsersHandler)))
@@ -121,7 +151,17 @@ func (s *Service) Start(stage adapter.StartStage) error {
 		if err != nil {
 			return E.Cause(err, "admin-api listen")
 		}
-		s.httpServer = &http.Server{Handler: s.router}
+		s.httpServer = &http.Server{
+			Handler:           s.router,
+			ReadHeaderTimeout: adminAPIReadHeaderTimeout,
+			ReadTimeout:       adminAPIReadTimeout,
+			IdleTimeout:       adminAPIIdleTimeout,
+			// WriteTimeout deliberately unset: streaming or large list
+			// responses must not be killed mid-flight by a server-side
+			// deadline. The body-limit middleware handles inbound
+			// resource bounds; outbound bounds are left to per-handler
+			// logic.
+		}
 		s.logger.Info("admin-api listening on ", s.listenAddr)
 		go func() {
 			if err := s.httpServer.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -204,6 +244,20 @@ func postOnly(next http.Handler) http.Handler {
 		if request.Method != http.MethodPost {
 			writer.WriteHeader(http.StatusMethodNotAllowed)
 			return
+		}
+		next.ServeHTTP(writer, request)
+	})
+}
+
+// bodyLimitMiddleware wraps r.Body with http.MaxBytesReader so every
+// handler downstream sees the same enforced ceiling. The wrapper closes
+// the underlying connection on overflow (a hint to misbehaving clients)
+// and surfaces the standard "http: request body too large" error to
+// callers, which our decoders already map to 400.
+func bodyLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Body != nil && request.Body != http.NoBody {
+			request.Body = http.MaxBytesReader(writer, request.Body, adminAPIMaxRequestBytes)
 		}
 		next.ServeHTTP(writer, request)
 	})

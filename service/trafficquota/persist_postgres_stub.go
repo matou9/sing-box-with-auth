@@ -23,6 +23,10 @@ func (p *PostgresPersister) LoadAll(string) (map[string]int64, error) {
 	return nil, E.New("postgres support requires with_postgres")
 }
 
+func (p *PostgresPersister) LoadMany(string, []string) (map[string]int64, error) {
+	return nil, E.New("postgres support requires with_postgres")
+}
+
 func (p *PostgresPersister) Save(string, string, int64) error {
 	return E.New("postgres support requires with_postgres")
 }

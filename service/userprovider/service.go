@@ -36,6 +36,7 @@ type Service struct {
 	postgresSource *PostgresSource
 	access         sync.Mutex
 	allUsers       []adapter.User
+	wg             sync.WaitGroup
 }
 
 type UserPatch struct {
@@ -104,18 +105,36 @@ func (s *Service) Start(stage adapter.StartStage) error {
 			return E.Cause(err, "start PostgreSQL source")
 		}
 	}
-	// Start polling/subscription loops
+	// Start polling/subscription loops. Each source goroutine is tracked by
+	// s.wg so Close() can wait for them to exit synchronously; without this
+	// plumbing, sources outlive Close() and leak across reload cycles.
 	if s.fileSource != nil {
-		go s.fileSource.Run(s.ctx, s.onSourceUpdate)
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.fileSource.Run(s.ctx, s.onSourceUpdate)
+		}()
 	}
 	if s.httpSource != nil {
-		go s.httpSource.Run(s.ctx, s.onSourceUpdate)
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.httpSource.Run(s.ctx, s.onSourceUpdate)
+		}()
 	}
 	if s.redisSource != nil {
-		go s.redisSource.Run(s.ctx, s.onSourceUpdate)
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.redisSource.Run(s.ctx, s.onSourceUpdate)
+		}()
 	}
 	if s.postgresSource != nil {
-		go s.postgresSource.Run(s.ctx, s.onSourceUpdate)
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.postgresSource.Run(s.ctx, s.onSourceUpdate)
+		}()
 	}
 	return nil
 }
@@ -149,8 +168,14 @@ func (s *Service) pushUsers(users []adapter.User) error {
 }
 
 func (s *Service) Close() error {
+	// Order matters: cancel signals all Run loops to exit, then close
+	// underlying transports/clients/pools so any goroutine currently blocked
+	// in driver I/O (redis Subscribe, pgx WaitForNotification, http.Do) is
+	// unblocked, and only then wait for the Run loops to fully exit.
 	s.cancel()
-	return common.Close(s.httpSource, s.redisSource, s.postgresSource)
+	closeErr := common.Close(s.httpSource, s.redisSource, s.postgresSource)
+	s.wg.Wait()
+	return closeErr
 }
 
 func (s *Service) ListUsers() []adapter.User {

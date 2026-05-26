@@ -80,8 +80,16 @@ func (s *RedisSource) Run(ctx context.Context, onUpdate func()) {
 	} else {
 		onUpdate()
 	}
-	// Start Pub/Sub listener and polling in parallel
-	go s.subscribe(ctx, onUpdate)
+	// Start Pub/Sub listener and polling in parallel. A local WaitGroup
+	// tracks the subscribe goroutine so Run does not return until it has
+	// also exited — required by Unit 2 of the 2026-05-14 memory-leak plan.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.subscribe(ctx, onUpdate)
+	}()
+	defer wg.Wait()
 	ticker := time.NewTicker(s.updateInterval)
 	defer ticker.Stop()
 	for {

@@ -349,78 +349,78 @@ func (s *Service) runPeriodResetLoop() {
 }
 
 func (s *Service) flushPending() error {
-	// Step 1: collect pending deltas under lock (fast, no I/O)
+	// Unit 4 of the 2026-05-14 memory-leak plan: persistAccess is held
+	// across the full flush so handlePeriodResets / RemoveConfig / restore
+	// cannot interleave their persistence I/O with this flush's IncrBy or
+	// LoadMany. The flush hot path is bounded to O(dirty_users), so the
+	// extended hold is acceptable; the previous unlocked steps allowed a
+	// late flush to resurrect a record that handlePeriodResets had just
+	// deleted.
 	s.persistAccess.Lock()
+	defer s.persistAccess.Unlock()
 	if s.persister == nil {
-		s.persistAccess.Unlock()
 		return nil
 	}
+
 	pending := s.manager.ConsumePendingDeltas()
-	// Filter out users that have been removed (RemoveConfig holds persistAccess when
-	// it calls persister.Delete, so checking HasQuota here is safe and prevents ghost
-	// records when RemoveConfig races with flushPending I/O in step 2).
-	for user := range pending {
-		if !s.manager.HasQuota(user) {
-			delete(pending, user)
+	// Filter users removed between AddBytes (which enqueued them) and now.
+	// Filtering here, rather than after IncrBy, prevents a ghost record
+	// from a delete-during-flush race.
+	active := pending[:0]
+	for _, pd := range pending {
+		if s.manager.HasQuota(pd.User) {
+			active = append(active, pd)
 		}
 	}
-	s.persistAccess.Unlock()
-
-	if len(pending) == 0 {
+	if len(active) == 0 {
 		return nil
 	}
 
-	// Step 2: execute I/O without holding the lock
 	var errs []error
 	periodUsers := make(map[string][]string)
-	for user, delta := range pending {
-		periodKey := s.manager.CurrentPeriodKey(user)
-		if err := s.persister.IncrBy(user, periodKey, delta); err != nil {
-			s.manager.RestorePendingDelta(user, delta)
-			errs = append(errs, E.Cause(err, "persist traffic quota delta for ", user))
+	for _, pd := range active {
+		if err := s.persister.IncrBy(pd.User, pd.PeriodKey, pd.Delta); err != nil {
+			s.manager.RestorePendingDelta(pd.User, pd.PeriodKey, pd.Delta)
+			errs = append(errs, E.Cause(err, "persist traffic quota delta for ", pd.User))
 			continue
 		}
-		periodUsers[periodKey] = append(periodUsers[periodKey], user)
+		periodUsers[pd.PeriodKey] = append(periodUsers[pd.PeriodKey], pd.User)
 	}
 
-	// Step 3: reload totals (I/O, still no lock)
-	loaded := make(map[string]map[string]int64)
-	for periodKey := range periodUsers {
-		result, err := s.persister.LoadAll(periodKey)
+	// Reload totals via LoadMany so the cost scales with active users
+	// rather than the configured user set.
+	for periodKey, users := range periodUsers {
+		result, err := s.persister.LoadMany(periodKey, users)
 		if err != nil {
 			errs = append(errs, E.Cause(err, "reload traffic quota totals for period ", periodKey))
 			continue
 		}
-		loaded[periodKey] = result
-	}
-
-	// Step 4: update in-memory state under lock
-	s.persistAccess.Lock()
-	for periodKey, users := range periodUsers {
-		if result, ok := loaded[periodKey]; ok {
-			for _, user := range users {
-				if value, ok := result[user]; ok {
-					s.manager.LoadUsage(user, value)
-				}
+		for _, user := range users {
+			if value, ok := result[user]; ok {
+				s.manager.LoadUsage(user, value)
 			}
 		}
 	}
-	s.persistAccess.Unlock()
 
 	return E.Errors(errs...)
 }
 
 func (s *Service) handlePeriodResets(now time.Time) error {
-	// Collect resets in memory (no I/O needed here)
+	// CheckPeriodReset only mutates in-memory state and is fast; the
+	// persister.Delete I/O is then serialized via persistAccess against
+	// flushPending. Without this serialization a late flush could
+	// resurrect the row we just deleted; see Unit 4 Risks.
 	resets := s.manager.CheckPeriodReset(now)
 	if len(resets) == 0 {
 		return nil
 	}
+
+	s.persistAccess.Lock()
+	defer s.persistAccess.Unlock()
 	if s.persister == nil {
 		return nil
 	}
 
-	// Execute persister.Delete outside the lock since it is remote I/O
 	var errs []error
 	for _, reset := range resets {
 		if err := s.persister.Delete(reset.User, reset.PreviousKey); err != nil {

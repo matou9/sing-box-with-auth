@@ -61,6 +61,16 @@ type Status struct {
 	Exceeded   bool
 }
 
+// connList shrink thresholds. See Unit 3 of the 2026-05-14 memory-leak
+// plan: a long peak followed by a low water mark would otherwise pin the
+// backing array forever. connListShrinkMinCap keeps shrink off the hot
+// path for short lists; connListShrinkRatio gates shrink to genuinely
+// underwater capacity so normal connection churn does not thrash.
+const (
+	connListShrinkMinCap = 1024
+	connListShrinkRatio  = 4
+)
+
 type connList struct {
 	access sync.Mutex
 	conns  []quotaTrackedConn
@@ -72,22 +82,59 @@ func (l *connList) add(conn quotaTrackedConn) {
 	l.access.Unlock()
 }
 
+// remove deletes conn from the list using swap-and-zero. The last slot is
+// nil-ed before the slice is truncated so the interface value (which
+// references the *QuotaConn and its onClose closure) is released for GC;
+// this is the fix for the residual reference identified in Unit 3 P1.
+// When the backing array has grown well past the live set, the slice is
+// reallocated to a smaller cap so a historical peak does not pin memory
+// permanently.
 func (l *connList) remove(conn quotaTrackedConn) {
 	l.access.Lock()
 	defer l.access.Unlock()
 	for i := range l.conns {
 		if l.conns[i] == conn {
-			l.conns = append(l.conns[:i], l.conns[i+1:]...)
+			last := len(l.conns) - 1
+			if i != last {
+				l.conns[i] = l.conns[last]
+			}
+			l.conns[last] = nil
+			l.conns = l.conns[:last]
+			if cap(l.conns) > connListShrinkMinCap && len(l.conns) < cap(l.conns)/connListShrinkRatio {
+				shrunk := make([]quotaTrackedConn, len(l.conns), len(l.conns)*2+1)
+				copy(shrunk, l.conns)
+				l.conns = shrunk
+			}
 			return
 		}
 	}
 }
 
+// closeAll snapshots the current list under the lock and notifies each
+// tracked conn outside the lock. Used by quota-exceeded trips where the
+// list itself must keep accepting future Register/Remove (i.e. the user
+// is not being deleted, only marked exceeded).
 func (l *connList) closeAll() {
 	l.access.Lock()
 	conns := append([]quotaTrackedConn(nil), l.conns...)
 	l.access.Unlock()
 	for _, conn := range conns {
+		conn.markQuotaExceeded()
+	}
+}
+
+// closeAllAndClear behaves like closeAll but also empties the list and
+// drops the backing array. Used by RemoveConfig so that, even if the
+// outer sync.Map.Delete is lazy (read map retains the value until the
+// next dirty-map promotion), the connList value held by that residual
+// entry no longer references any *QuotaConn or onClose closure.
+func (l *connList) closeAllAndClear() {
+	l.access.Lock()
+	snapshot := append([]quotaTrackedConn(nil), l.conns...)
+	clear(l.conns)
+	l.conns = nil
+	l.access.Unlock()
+	for _, conn := range snapshot {
 		conn.markQuotaExceeded()
 	}
 }
@@ -118,12 +165,71 @@ func (s *userState) setPeriodKeyIfEmpty(periodKey string) {
 	s.periodAccess.Unlock()
 }
 
+// PendingDelta carries a single user's accumulated traffic increment
+// stamped with the period it belongs to. ConsumePendingDeltas returns
+// these so flushPending can attribute deltas to the correct period even
+// when a period reset races with the flush.
+type PendingDelta struct {
+	User      string
+	PeriodKey string
+	Delta     int64
+}
+
+// QuotaManager lock order (enforced; see Unit 6 of the 2026-05-14
+// memory-leak plan):
+//
+//	lifecycle (R/W)  →  userState.periodAccess  →  connList.access  →  (no-lock callbacks)
+//
+// Additional rules:
+//   - RegisterConn takes lifecycle.RLock for the whole sequence
+//     loadConfig → stateFor → activeConns.LoadOrStore → connList.add.
+//     RemoveConfig takes lifecycle.Lock briefly to swap map state, then
+//     releases before calling connList.closeAllAndClear in the open. This
+//     pair closes the orphan-conn race where a new conn could be added to
+//     a list already removed from activeConns.
+//   - tripExceeded does NOT take lifecycle: the usage hot path must not
+//     wait on configuration changes. It is safe to closeAll a list that
+//     has just been unlinked — by Unit 3 Safety Proof P3 a redundant
+//     markQuotaExceeded is a no-op.
+//   - QuotaConn.Close's onClose callback (which removes from connList)
+//     holds no outer lock; it is allowed to run against a list that has
+//     already been zeroed out by closeAllAndClear.
+//   - connList.access is a leaf lock: nothing else may be acquired while
+//     it is held, and no callback (markQuotaExceeded, onClose, etc.) may
+//     run inside its critical section.
 type QuotaManager struct {
+	// lifecycle serializes RegisterConn (RLock) against RemoveConfig
+	// (Lock). Read-write asymmetric because conn registration is the hot
+	// path and benefits from concurrent reads; configuration changes are
+	// the slow path and can afford a short exclusive section.
+	lifecycle        sync.RWMutex
 	userConfigAccess sync.RWMutex
 	userConfigs      map[string]*QuotaConfig
-	activeConns      compatible.Map[string, *connList]
-	states           compatible.Map[string, *userState]
-	now              func() time.Time
+	// activeConns is keyed by user name. Entries are created lazily by
+	// RegisterConn (LoadOrStore on first conn) and are removed *only* by
+	// RemoveConfig. A user that never opens a tracked connection produces
+	// no entry; once an entry exists it persists even if the user's
+	// active connection count drops back to zero — this avoids a
+	// LoadOrStore <-> Delete race in steady state. Capacity is therefore
+	// bounded by the configured user count, not by historical connection
+	// peaks (the underlying connList shrinks separately via Unit 3).
+	activeConns compatible.Map[string, *connList]
+	// states is keyed by user name. Entries are created lazily on the
+	// first AddBytes / LoadUsage / RegisterConn and removed only by
+	// RemoveConfig. A user with quota=0 (config exists but no usage yet)
+	// still gets a state entry once any AddBytes is observed; this is
+	// deliberate so period-key bookkeeping survives an idle window.
+	// Capacity contract is the same as activeConns: bounded by configured
+	// user count. See Unit 7 of the 2026-05-14 memory-leak plan.
+	states compatible.Map[string, *userState]
+	now    func() time.Time
+	// dirty-user index, see Unit 4 of the 2026-05-14 memory-leak plan.
+	// AddBytes (and RestorePendingDelta) enqueue a user; ConsumePendingDeltas
+	// drains the queue under dirtyMu and only inspects those users' state.
+	// This decouples flush cost from the total quota-user count.
+	dirtyMu    sync.Mutex
+	dirtySet   map[string]struct{}
+	dirtyQueue []string
 }
 
 func NewQuotaManager(options option.TrafficQuotaServiceOptions) (*QuotaManager, error) {
@@ -165,23 +271,41 @@ func NewQuotaManager(options option.TrafficQuotaServiceOptions) (*QuotaManager, 
 	return &QuotaManager{
 		userConfigs: userConfigs,
 		now:         time.Now,
+		dirtySet:    make(map[string]struct{}),
 	}, nil
 }
 
 func (m *QuotaManager) RegisterConn(user string, conn quotaTrackedConn) (func(int), func()) {
+	// lifecycle.RLock spans the entire registration sequence so that a
+	// concurrent RemoveConfig (which takes lifecycle.Lock) cannot
+	// interleave between "load config / get connList" and "connList.add",
+	// which is the orphan-conn race fixed by Unit 6 of the 2026-05-14
+	// memory-leak plan. The lock is released BEFORE the closure is
+	// returned — onClose / onBytes do not need lifecycle.
+	m.lifecycle.RLock()
 	if _, loaded := m.loadConfig(user); !loaded {
+		m.lifecycle.RUnlock()
 		return nil, nil
 	}
 	state := m.stateFor(user)
 	state.setPeriodKeyIfEmpty(m.mustPeriodKey(user, m.now()))
 	connList, _ := m.activeConns.LoadOrStore(user, &connList{})
 	connList.add(conn)
-	if state.exceeded.Load() {
+	exceeded := state.exceeded.Load()
+	m.lifecycle.RUnlock()
+
+	if exceeded {
+		// markQuotaExceeded is a no-lock callback per the leaf-lock rule;
+		// run it after releasing lifecycle to avoid holding it across a
+		// caller-defined notification.
 		conn.markQuotaExceeded()
 	}
 	return func(n int) {
 			m.AddBytes(user, n)
 		}, func() {
+			// onClose path: no outer lock. remove tolerates a list that
+			// has been zeroed out by a concurrent RemoveConfig — see
+			// Unit 3 Safety Proof P1/P3.
 			connList.remove(conn)
 		}
 }
@@ -212,12 +336,24 @@ func (m *QuotaManager) RemoveConfig(user string) error {
 	if user == "" {
 		return E.New("traffic-quota user missing name")
 	}
+	// lifecycle.Lock holds only across the map mutations. The slow
+	// closeAllAndClear (which iterates the list and calls
+	// markQuotaExceeded on each conn) runs in the open so that a single
+	// user with many active connections does not block other users'
+	// RegisterConn calls. The Load → Delete pair is atomic via
+	// LoadAndDelete so a racing RegisterConn either observes the
+	// pre-delete connList (and adds to it; that conn is then included in
+	// the closeAllAndClear we are about to run) or observes "loadConfig
+	// returns false" and bails out cleanly.
+	m.lifecycle.Lock()
 	m.deleteConfig(user)
-	if cl, ok := m.activeConns.Load(user); ok {
-		cl.closeAll()
-	}
-	m.activeConns.Delete(user)
+	cl, _ := m.activeConns.LoadAndDelete(user)
 	m.states.Delete(user)
+	m.lifecycle.Unlock()
+
+	if cl != nil {
+		cl.closeAllAndClear()
+	}
 	return nil
 }
 
@@ -309,9 +445,21 @@ func (m *QuotaManager) AddBytes(user string, n int) {
 		return
 	}
 	state := m.stateFor(user)
-	state.setPeriodKeyIfEmpty(m.mustPeriodKey(user, m.now()))
+	// periodAccess covers the periodKey check AND the pendingDelta update
+	// in the same critical section. This is what makes ConsumePendingDeltas
+	// and CheckPeriodReset see a consistent (periodKey, pendingDelta) pair
+	// — the invariant Unit 4 requires to prevent old-period bytes from
+	// being attributed to a new period.
+	state.periodAccess.Lock()
+	if state.periodKey == "" {
+		state.periodKey = m.mustPeriodKey(user, m.now())
+	}
 	total := state.usage.Add(int64(n))
 	state.pendingDelta.Add(int64(n))
+	state.periodAccess.Unlock()
+
+	m.markDirty(user)
+
 	if total > config.quotaBytes {
 		m.tripExceeded(user, state)
 	}
@@ -353,18 +501,28 @@ func (m *QuotaManager) CheckPeriodReset(now time.Time) []PeriodReset {
 			continue
 		}
 		currentKey := m.mustPeriodKey(user, now)
-		previousKey := state.getPeriodKey()
+
+		// All period+pending mutations happen inside the same periodAccess
+		// critical section so AddBytes / ConsumePendingDeltas observe an
+		// atomic boundary: either fully on the old period (with usage and
+		// pendingDelta visible) or fully on the new one (cleared).
+		state.periodAccess.Lock()
+		previousKey := state.periodKey
 		if previousKey == "" {
-			state.setPeriodKey(currentKey)
+			state.periodKey = currentKey
+			state.periodAccess.Unlock()
 			continue
 		}
 		if currentKey == previousKey {
+			state.periodAccess.Unlock()
 			continue
 		}
 		state.pendingDelta.Swap(0)
 		state.usage.Store(0)
 		state.exceeded.Store(false)
-		state.setPeriodKey(currentKey)
+		state.periodKey = currentKey
+		state.periodAccess.Unlock()
+
 		resets = append(resets, PeriodReset{
 			User:          user,
 			PreviousKey:   previousKey,
@@ -398,27 +556,80 @@ func (m *QuotaManager) Users() []string {
 	return append(users, m.userNames()...)
 }
 
-func (m *QuotaManager) ConsumePendingDeltas() map[string]int64 {
-	pending := make(map[string]int64)
-	for _, user := range m.userNames() {
+// ConsumePendingDeltas atomically drains the dirty-user queue and returns
+// one PendingDelta per user with a non-zero accumulated increment, each
+// stamped with the periodKey it belonged to at consume time. Concurrent
+// AddBytes calls during the drain are not lost: any user enqueued after
+// the dirtyMu drain falls into the next flush cycle. A zero-delta entry
+// can appear on the next round if AddBytes raced past the drain — that is
+// harmless (the second flush sees delta==0 and skips), and is preferable
+// to a contended single critical section.
+func (m *QuotaManager) ConsumePendingDeltas() []PendingDelta {
+	m.dirtyMu.Lock()
+	users := m.dirtyQueue
+	m.dirtyQueue = nil
+	m.dirtySet = make(map[string]struct{})
+	m.dirtyMu.Unlock()
+
+	if len(users) == 0 {
+		return nil
+	}
+	pending := make([]PendingDelta, 0, len(users))
+	for _, user := range users {
 		state, loaded := m.states.Load(user)
 		if !loaded {
 			continue
 		}
+		state.periodAccess.Lock()
+		periodKey := state.periodKey
 		delta := state.pendingDelta.Swap(0)
-		if delta != 0 {
-			pending[user] = delta
+		state.periodAccess.Unlock()
+		if delta == 0 {
+			continue
 		}
+		pending = append(pending, PendingDelta{
+			User:      user,
+			PeriodKey: periodKey,
+			Delta:     delta,
+		})
 	}
 	return pending
 }
 
-func (m *QuotaManager) RestorePendingDelta(user string, delta int64) {
+// RestorePendingDelta re-adds a delta whose IncrBy failed back into the
+// user's pending bucket, but only if the user is still on the same period
+// the delta was originally consumed from. If the period rolled over in
+// the meantime the delta is dropped to avoid carrying old-period bytes
+// into the new period (the slight under-count is bounded by the
+// flush-failure window and is preferable to mis-attributed accounting).
+func (m *QuotaManager) RestorePendingDelta(user, periodKey string, delta int64) {
 	if delta == 0 || !m.HasQuota(user) {
 		return
 	}
 	state := m.stateFor(user)
-	state.pendingDelta.Add(delta)
+	state.periodAccess.Lock()
+	matched := state.periodKey == periodKey
+	if matched {
+		state.pendingDelta.Add(delta)
+	}
+	state.periodAccess.Unlock()
+	if matched {
+		m.markDirty(user)
+	}
+}
+
+// markDirty enqueues a user for the next flush. The dirtyMu critical
+// section is tiny: a map lookup and at most one slice append. The lock
+// order is sequential — periodAccess is released before markDirty is
+// called, never nested — so there is no chance of a periodAccess <→>
+// dirtyMu deadlock with CheckPeriodReset or ConsumePendingDeltas.
+func (m *QuotaManager) markDirty(user string) {
+	m.dirtyMu.Lock()
+	if _, ok := m.dirtySet[user]; !ok {
+		m.dirtySet[user] = struct{}{}
+		m.dirtyQueue = append(m.dirtyQueue, user)
+	}
+	m.dirtyMu.Unlock()
 }
 
 func (m *QuotaManager) stateFor(user string) *userState {

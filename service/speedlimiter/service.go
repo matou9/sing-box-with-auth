@@ -62,7 +62,7 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	s.logger.Info("speed-limiter registered as connection tracker")
 
 	// Start schedule loop
-	s.manager.StartScheduleLoop(s.ctx)
+	s.manager.StartScheduleLoop(s.ctx, &s.wg)
 	s.startDynamicSources()
 	return nil
 }

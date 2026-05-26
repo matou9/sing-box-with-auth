@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -530,10 +531,14 @@ func (m *LimiterManager) CheckSchedules(now time.Time) {
 }
 
 // StartScheduleLoop starts a goroutine that checks schedules every minute.
-func (m *LimiterManager) StartScheduleLoop(ctx context.Context) {
-	// Initial check
+// The caller's WaitGroup tracks the loop goroutine so Service.Close can wait
+// for it to exit synchronously.
+func (m *LimiterManager) StartScheduleLoop(ctx context.Context, wg *sync.WaitGroup) {
+	// Initial check runs on the caller goroutine to preserve original semantics.
 	m.CheckSchedules(time.Now())
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 		for {
@@ -574,8 +579,23 @@ func (m *LimiterManager) updateLimiterRates(now time.Time) {
 	})
 }
 
-// cleanExpiredClientLimiters removes per-client limiters that have been inactive
-// beyond the configured TTL. Per-user limiters (no separator in key) are never cleaned.
+// cleanExpiredClientLimiters removes per-client limiters that have been
+// inactive beyond the configured TTL. Per-user limiters (no separator in
+// key) are *never* cleaned by this loop — they are only removed by
+// RemoveConfig.
+//
+// Capacity contract (Unit 7 of the 2026-05-14 memory-leak plan):
+// per-user limiters accumulate one entry per distinct user name observed
+// by the service. The hot path here is lock-free, so we deliberately do
+// not add TTL eviction for per-user entries. Instead, callers must keep
+// the set of user names bounded — typically the user-provider upstream
+// (file/HTTP/Redis/Postgres source) already enforces this. If a deployment
+// adopts an unbounded-username scheme (rare; e.g. session tokens used as
+// users), either switch to per-client mode or extend RemoveConfig with a
+// background sweep. As of 2026-05, the regression test
+// TestPerClient_RemoveConfig_CleansAllClientLimiters guards the
+// RemoveConfig path so a future refactor cannot silently regress the
+// only sanctioned cleanup hook.
 func (m *LimiterManager) cleanExpiredClientLimiters(now time.Time) {
 	snap := m.config.Load()
 	ttlSeconds := int64(snap.clientTTL / time.Second)

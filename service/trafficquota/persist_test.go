@@ -30,4 +30,20 @@ func TestNoopPersisterContract(t *testing.T) {
 	if len(all) != 0 {
 		t.Fatalf("expected empty load-all result, got: %#v", all)
 	}
+
+	many, err := persister.LoadMany("2026-04", []string{"alice", "bob"})
+	if err != nil {
+		t.Fatalf("load many failed: %v", err)
+	}
+	if len(many) != 0 {
+		t.Fatalf("expected empty load-many result, got: %#v", many)
+	}
+
+	emptyMany, err := persister.LoadMany("2026-04", nil)
+	if err != nil {
+		t.Fatalf("load many with nil users failed: %v", err)
+	}
+	if len(emptyMany) != 0 {
+		t.Fatalf("expected empty result for nil users, got: %#v", emptyMany)
+	}
 }

@@ -23,6 +23,10 @@ func (p *RedisPersister) LoadAll(string) (map[string]int64, error) {
 	return nil, E.New("redis support requires with_redis")
 }
 
+func (p *RedisPersister) LoadMany(string, []string) (map[string]int64, error) {
+	return nil, E.New("redis support requires with_redis")
+}
+
 func (p *RedisPersister) Save(string, string, int64) error {
 	return E.New("redis support requires with_redis")
 }

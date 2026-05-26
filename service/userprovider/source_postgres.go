@@ -96,8 +96,16 @@ func (s *PostgresSource) Run(ctx context.Context, onUpdate func()) {
 	} else {
 		onUpdate()
 	}
-	// Start LISTEN in parallel
-	go s.listen(ctx, onUpdate)
+	// Start LISTEN in parallel. A local WaitGroup tracks the listen
+	// goroutine so Run does not return until it has also exited — required
+	// by Unit 2 of the 2026-05-14 memory-leak plan.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.listen(ctx, onUpdate)
+	}()
+	defer wg.Wait()
 	// Polling fallback
 	ticker := time.NewTicker(s.updateInterval)
 	defer ticker.Stop()

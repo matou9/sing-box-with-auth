@@ -86,6 +86,47 @@ func (p *RedisPersister) LoadAll(periodKey string) (map[string]int64, error) {
 	return result, nil
 }
 
+// LoadMany batches MGET requests so the flush hot path scales with the
+// dirty-user count instead of the total user set. Each MGET is at most
+// loadManyBatchSize keys to keep a single Redis packet bounded. nil
+// values are skipped (the user has never been persisted in this period).
+func (p *RedisPersister) LoadMany(periodKey string, users []string) (map[string]int64, error) {
+	if len(users) == 0 {
+		return map[string]int64{}, nil
+	}
+	result := make(map[string]int64, len(users))
+	for start := 0; start < len(users); start += loadManyBatchSize {
+		end := start + loadManyBatchSize
+		if end > len(users) {
+			end = len(users)
+		}
+		batch := users[start:end]
+		keys := make([]string, len(batch))
+		for i, user := range batch {
+			keys[i] = p.key(user, periodKey)
+		}
+		values, err := p.client.MGet(p.ctx, keys...).Result()
+		if err != nil {
+			return nil, E.Cause(err, "redis MGET traffic quota batch")
+		}
+		for i, v := range values {
+			if v == nil {
+				continue
+			}
+			str, ok := v.(string)
+			if !ok {
+				return nil, E.New("unexpected redis MGET value type for ", batch[i])
+			}
+			parsed, parseErr := strconv.ParseInt(str, 10, 64)
+			if parseErr != nil {
+				return nil, E.Cause(parseErr, "parse redis quota value for ", batch[i])
+			}
+			result[batch[i]] = parsed
+		}
+	}
+	return result, nil
+}
+
 func (p *RedisPersister) Save(user, periodKey string, bytes int64) error {
 	return p.client.Set(p.ctx, p.key(user, periodKey), bytes, 0).Err()
 }
