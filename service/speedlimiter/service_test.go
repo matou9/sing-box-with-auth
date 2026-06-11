@@ -62,6 +62,39 @@ func TestSpeedServiceRemoveDynamicRemovesFromManager(t *testing.T) {
 	}
 }
 
+// TestSpeedServiceApplyDynamicZeroSpeeds covers rows delivered by the shared
+// dynamic-config sources that carry only quota fields: zero speeds must not be
+// treated as an invalid config. An authoritative (full Postgres) row clears an
+// existing limit; a partial (Redis) update leaves it untouched.
+func TestSpeedServiceApplyDynamicZeroSpeeds(t *testing.T) {
+	s := newTestSpeedService(t)
+
+	if err := s.applyDynamic(dynamicconfig.ConfigRow{User: "bob", QuotaGB: 10, Authoritative: true}); err != nil {
+		t.Fatalf("applyDynamic quota-only row for unknown user: %v", err)
+	}
+	if _, found := s.GetConfig("bob"); found {
+		t.Fatal("expected no speed config for bob after quota-only row")
+	}
+
+	if err := s.applyDynamic(dynamicconfig.ConfigRow{User: "bob", UploadMbps: 10, DownloadMbps: 20, Authoritative: true}); err != nil {
+		t.Fatalf("applyDynamic: %v", err)
+	}
+
+	if err := s.applyDynamic(dynamicconfig.ConfigRow{User: "bob", QuotaGB: 10}); err != nil {
+		t.Fatalf("applyDynamic partial quota-only update: %v", err)
+	}
+	if _, found := s.GetConfig("bob"); !found {
+		t.Fatal("expected partial update to keep bob's speed config")
+	}
+
+	if err := s.applyDynamic(dynamicconfig.ConfigRow{User: "bob", QuotaGB: 10, Authoritative: true}); err != nil {
+		t.Fatalf("applyDynamic authoritative zero-speed row: %v", err)
+	}
+	if _, found := s.GetConfig("bob"); found {
+		t.Fatal("expected authoritative zero-speed row to remove bob's speed config")
+	}
+}
+
 // TestSpeedLimiterCloseTerminatesScheduleLoop verifies Unit 1 of the
 // 2026-05-14 memory-leak fix plan: Service.Close() must synchronously wait
 // for the schedule-loop goroutine to exit. Without the WaitGroup plumbing,

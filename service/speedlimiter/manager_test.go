@@ -425,6 +425,64 @@ func TestManager_ScheduleLoop(t *testing.T) {
 	wg.Wait()
 }
 
+// TestRemoveConfigUnthrottlesLiveConnections: ThrottledConn captures the
+// *rate.Limiter pointers at connection setup, so RemoveConfig must lift the
+// rate on the dropped limiters or already-established connections would stay
+// throttled at the old rate until they reconnect.
+func TestRemoveConfigUnthrottlesLiveConnections(t *testing.T) {
+	m, err := NewLimiterManager(option.SpeedLimiterServiceOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ApplyConfig(option.SpeedLimiterUser{Name: "bob", UploadMbps: 1, DownloadMbps: 2}); err != nil {
+		t.Fatalf("apply config: %v", err)
+	}
+	ul := m.GetOrCreateLimiter("bob")
+	if ul == nil || ul.Upload == nil || ul.Download == nil {
+		t.Fatal("expected upload and download limiters for bob")
+	}
+	upload, download := ul.Upload, ul.Download
+
+	if err := m.RemoveConfig("bob"); err != nil {
+		t.Fatalf("remove config: %v", err)
+	}
+	if upload.Limit() != rate.Inf {
+		t.Errorf("captured upload limiter limit = %v, want rate.Inf", upload.Limit())
+	}
+	if download.Limit() != rate.Inf {
+		t.Errorf("captured download limiter limit = %v, want rate.Inf", download.Limit())
+	}
+}
+
+// TestZeroedDirectionUnthrottlesLiveConnections: zeroing a single direction
+// goes through reconcileLimiterDirection, which must also lift the rate on
+// the dropped limiter for connections that captured it.
+func TestZeroedDirectionUnthrottlesLiveConnections(t *testing.T) {
+	m, err := NewLimiterManager(option.SpeedLimiterServiceOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ApplyConfig(option.SpeedLimiterUser{Name: "bob", UploadMbps: 1, DownloadMbps: 2}); err != nil {
+		t.Fatalf("apply config: %v", err)
+	}
+	ul := m.GetOrCreateLimiter("bob")
+	if ul == nil || ul.Upload == nil {
+		t.Fatal("expected upload limiter for bob")
+	}
+	upload := ul.Upload
+
+	if err := m.ApplyConfig(option.SpeedLimiterUser{Name: "bob", UploadMbps: 0, DownloadMbps: 2}); err != nil {
+		t.Fatalf("apply config without upload limit: %v", err)
+	}
+	if upload.Limit() != rate.Inf {
+		t.Errorf("captured upload limiter limit = %v, want rate.Inf", upload.Limit())
+	}
+	if ul.Upload != nil {
+		t.Error("expected upload direction to be dropped from the shared limiter")
+	}
+	assertRate(t, "download after zeroing upload", ul.Download, 2)
+}
+
 // parseTime edge cases
 func TestParseSchedule_Valid(t *testing.T) {
 	s := option.SpeedLimiterSchedule{

@@ -451,10 +451,14 @@ func (m *LimiterManager) RemoveConfig(user string) error {
 	delete(newSnap.userRawConfig, user)
 	m.config.Store(newSnap)
 
-	// Remove all limiters for this user (both per-user and per-client keys)
+	// Remove all limiters for this user (both per-user and per-client keys).
+	// Neutralize before deleting so connections that captured the limiter
+	// pointers at setup stop throttling immediately.
 	prefix := user + clientLimiterKeySep
-	m.limiters.Range(func(key string, _ *UserLimiter) bool {
+	m.limiters.Range(func(key string, limiter *UserLimiter) bool {
 		if key == user || strings.HasPrefix(key, prefix) {
+			neutralizeLimiter(limiter.Upload)
+			neutralizeLimiter(limiter.Download)
 			m.limiters.Delete(key)
 		}
 		return true
@@ -567,6 +571,8 @@ func (m *LimiterManager) updateLimiterRates(now time.Time) {
 		userName := extractUserName(key)
 		cfg := snap.effectiveSpeed(userName, now)
 		if cfg == nil {
+			neutralizeLimiter(limiter.Upload)
+			neutralizeLimiter(limiter.Download)
 			m.limiters.Delete(key)
 			return true
 		}
@@ -727,6 +733,18 @@ func reconcileLimiterDirection(limiter **rate.Limiter, mbps int) {
 	case mbps > 0:
 		SetLimiterRate(*limiter, mbps)
 	default:
+		neutralizeLimiter(*limiter)
 		*limiter = nil
 	}
+}
+
+// neutralizeLimiter lifts the rate on a limiter before it is dropped.
+// ThrottledConn captures *rate.Limiter pointers at connection setup, so
+// removing the map entry alone would keep already-established connections
+// throttled at the old rate until they reconnect.
+func neutralizeLimiter(limiter *rate.Limiter) {
+	if limiter == nil {
+		return
+	}
+	limiter.SetLimit(rate.Inf)
 }

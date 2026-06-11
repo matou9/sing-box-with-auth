@@ -452,7 +452,17 @@ func (m *QuotaManager) AddBytes(user string, n int) {
 	// being attributed to a new period.
 	state.periodAccess.Lock()
 	if state.periodKey == "" {
-		state.periodKey = m.mustPeriodKey(user, m.now())
+		// An empty periodKey here can mean a concurrent RemoveConfig ran
+		// between the loadConfig check above and stateFor (which then
+		// resurrected an empty state). mustPeriodKey would panic on the
+		// now-missing config, so re-resolve via the error-returning variant
+		// and drop the bytes — the user's quota is gone anyway.
+		key, err := m.GetCurrentPeriodKey(user, m.now())
+		if err != nil {
+			state.periodAccess.Unlock()
+			return
+		}
+		state.periodKey = key
 	}
 	total := state.usage.Add(int64(n))
 	state.pendingDelta.Add(int64(n))

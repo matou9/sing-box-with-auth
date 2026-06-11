@@ -100,6 +100,19 @@ func (s *Service) startDynamicSources() {
 func (s *Service) applyDynamic(row dynamicconfig.ConfigRow) error {
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
+	if row.UploadMbps <= 0 && row.DownloadMbps <= 0 {
+		// The dynamic sources are shared with the traffic-quota service, so a
+		// row may carry only quota fields. Zero speeds mean "no limit", not an
+		// invalid config: an authoritative (full) row clears any existing
+		// limit, a partial update leaves it untouched.
+		if !row.Authoritative {
+			return nil
+		}
+		if _, found := s.manager.GetConfig(row.User); !found {
+			return nil
+		}
+		return s.manager.RemoveConfig(row.User)
+	}
 	return s.manager.ApplyConfig(option.SpeedLimiterUser{
 		Name:         row.User,
 		UploadMbps:   row.UploadMbps,

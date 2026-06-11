@@ -116,7 +116,7 @@ func (s *PostgresSource) fetchAll(ctx context.Context) error {
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var row ConfigRow
+		row := ConfigRow{Authoritative: true}
 		if err := rows.Scan(&row.User, &row.UploadMbps, &row.DownloadMbps,
 			&row.PerClient,
 			&row.QuotaGB, &row.Period, &row.PeriodStart, &row.PeriodDays); err != nil {
@@ -137,7 +137,7 @@ func (s *PostgresSource) fetchUser(ctx context.Context, user string) error {
 	                 COALESCE(quota_gb,0), COALESCE(quota_period,''),
 	                 COALESCE(quota_period_start,''), COALESCE(quota_period_days,0)
 	          FROM ` + s.quotedTable + ` WHERE name = $1`
-	row := ConfigRow{User: user}
+	row := ConfigRow{User: user, Authoritative: true}
 	err := s.pool.QueryRow(ctx, query, user).Scan(
 		&row.UploadMbps, &row.DownloadMbps,
 		&row.PerClient,

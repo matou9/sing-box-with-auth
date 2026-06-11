@@ -245,6 +245,44 @@ func TestServiceApplyDynamicUpdatesManager(t *testing.T) {
 	}
 }
 
+// TestServiceApplyDynamicZeroQuota covers rows delivered by the shared
+// dynamic-config sources that carry only speed fields: quota_gb = 0 must not
+// be treated as an invalid config. An authoritative (full Postgres) row clears
+// an existing quota; a partial (Redis) update leaves it untouched.
+func TestServiceApplyDynamicZeroQuota(t *testing.T) {
+	rawService, err := NewService(context.Background(), log.NewNOPFactory().Logger(), "quota", option.TrafficQuotaServiceOptions{})
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	s := rawService.(*Service)
+	s.persister = NewNoopPersister()
+
+	if err := s.applyDynamic(dynamicconfig.ConfigRow{User: "alice", UploadMbps: 10, Authoritative: true}); err != nil {
+		t.Fatalf("applyDynamic speed-only row for unknown user: %v", err)
+	}
+	if s.manager.HasQuota("alice") {
+		t.Fatal("expected no quota for alice after speed-only row")
+	}
+
+	if err := s.applyDynamic(dynamicconfig.ConfigRow{User: "alice", QuotaGB: 10, Period: "monthly", Authoritative: true}); err != nil {
+		t.Fatalf("applyDynamic: %v", err)
+	}
+
+	if err := s.applyDynamic(dynamicconfig.ConfigRow{User: "alice", UploadMbps: 10}); err != nil {
+		t.Fatalf("applyDynamic partial speed-only update: %v", err)
+	}
+	if !s.manager.HasQuota("alice") {
+		t.Fatal("expected partial update to keep alice's quota")
+	}
+
+	if err := s.applyDynamic(dynamicconfig.ConfigRow{User: "alice", UploadMbps: 10, Authoritative: true}); err != nil {
+		t.Fatalf("applyDynamic authoritative zero-quota row: %v", err)
+	}
+	if s.manager.HasQuota("alice") {
+		t.Fatal("expected authoritative zero-quota row to remove alice's quota")
+	}
+}
+
 func TestServiceRemoveDynamicRemovesFromManager(t *testing.T) {
 	rawService, err := NewService(context.Background(), log.NewNOPFactory().Logger(), "quota", option.TrafficQuotaServiceOptions{})
 	if err != nil {

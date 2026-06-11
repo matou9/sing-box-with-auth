@@ -9,6 +9,49 @@ import (
 	"github.com/sagernet/sing-box/option"
 )
 
+// TestQuotaManagerAddBytesRemoveConfigNoPanic covers the unlocked AddBytes
+// hot path racing RemoveConfig: AddBytes can pass its loadConfig check, lose
+// the CPU while RemoveConfig deletes both config and state, then resurrect an
+// empty state via stateFor. Pre-fix, the empty-periodKey branch called
+// mustPeriodKey, which panics once the config is gone.
+func TestQuotaManagerAddBytesRemoveConfigNoPanic(t *testing.T) {
+	manager, err := NewQuotaManager(option.TrafficQuotaServiceOptions{
+		Users: []option.TrafficQuotaUser{
+			{Name: "alice", QuotaGB: quotaGB(1 << 30), Period: "daily"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					manager.AddBytes("alice", 1)
+				}
+			}
+		}()
+	}
+	for i := 0; i < 200; i++ {
+		if err := manager.RemoveConfig("alice"); err != nil {
+			t.Errorf("remove config: %v", err)
+		}
+		if err := manager.ApplyConfig(option.TrafficQuotaUser{Name: "alice", QuotaGB: quotaGB(1 << 30), Period: "daily"}); err != nil {
+			t.Errorf("apply config: %v", err)
+		}
+	}
+	close(stop)
+	wg.Wait()
+}
+
 func TestQuotaManagerResolvesGroupAndUserOverride(t *testing.T) {
 	manager, err := NewQuotaManager(option.TrafficQuotaServiceOptions{
 		Groups: []option.TrafficQuotaGroup{

@@ -11,6 +11,11 @@ type ConfigRow struct {
 	Period       string
 	PeriodStart  string
 	PeriodDays   int
+	// Authoritative marks rows that carry the user's complete config (a
+	// Postgres row). In an authoritative row a zero field means "unset" and
+	// must clear the corresponding runtime config; in a partial update (a
+	// Redis message) a zero field means "leave unchanged".
+	Authoritative bool
 }
 
 // Receiver is the callback pair that dynamic sources call when a user config
